@@ -111,7 +111,7 @@
   {"name": "generated", "pg_columns": "v integer GENERATED ALWAYS AS (42) STORED", "ch_columns": "v Nullable(Int32)", "status": "unknown"},
   {"name": "reordered", "pg_columns": "v integer NOT NULL, label text NOT NULL", "ch_columns": "label String, v Int32", "status": "match"},
   {"name": "missing_column", "pg_columns": "v integer NOT NULL, label text NOT NULL", "ch_columns": "v Int32", "status": "mismatch", "code": "source_column_missing_in_target"},
-  {"name": "extra_column", "pg_columns": "v integer NOT NULL", "ch_columns": "v Int32, extra String DEFAULT ''", "status": "mismatch", "code": "target_only_column"},
+  {"name": "extra_column", "pg_columns": "v integer NOT NULL", "ch_columns": "v Int32, extra String DEFAULT ''", "status": "compatible", "code": "target_only_column"},
   {"name": "ignored_extra", "pg_columns": "v integer NOT NULL", "ch_columns": "v Int32, extra String DEFAULT ''", "status": "match", "ignore": ["extra"]},
   {"name": "renamed_column", "pg_columns": "v integer NOT NULL", "ch_columns": "renamed Int32", "status": "mismatch"},
   {"name": "dropped_pg_attribute", "pg_columns": "v integer NOT NULL, gone text", "ch_columns": "v Int32", "status": "match", "pg_after": ["ALTER TABLE {table} DROP COLUMN gone"]},

@@ -3,7 +3,7 @@ name = "sync-pg2ch"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
-description = "Read-only PostgreSQL to ClickHouse schema compatibility diff"
+description = "PostgreSQL to ClickHouse schema diff and preflighted DDL"
 
 [features]
 default = []

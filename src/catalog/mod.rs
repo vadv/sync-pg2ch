@@ -1,5 +1,6 @@
-//! Read-only database catalog adapters.
+//! Database catalog adapters and a separate ClickHouse DDL executor.
 pub mod clickhouse;
+pub(crate) mod ddl;
 pub mod postgres;
 
 use serde::Serialize;

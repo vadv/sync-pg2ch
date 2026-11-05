@@ -37,11 +37,22 @@ enum Node {
     Array(Box<Node>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct Target {
     scalar: Scalar,
     nullable: bool,
     low_cardinality: bool,
+}
+
+/// Compare normalized CH types without losing unsupported but unchanged definitions.
+pub(crate) fn same_target_type(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    match (parse_target(left), parse_target(right)) {
+        (Ok(left), Ok(right)) => left.scalar != Scalar::Geo && left == right,
+        _ => false,
+    }
 }
 
 #[derive(Debug)]
@@ -68,6 +79,58 @@ pub(crate) struct TypeComparison {
 pub(crate) fn expected_definition(source: &PgType) -> Result<String, String> {
     let expected = expected_type(source)?;
     Ok(expected.definition)
+}
+
+/// Choose an ALTER destination that retains both existing CH values and PG requirements.
+pub(crate) fn alter_destination(
+    source: &PgType,
+    source_nullable: bool,
+    current: &str,
+) -> Result<String, String> {
+    let comparison = compare_types(source, current);
+    if comparison.status == Status::Unknown {
+        return Err(comparison.message);
+    }
+    let expected = expected_type(source)?;
+    let mut target = parse_target(current)?;
+    if comparison.status == Status::Mismatch {
+        target.scalar = match (&expected.scalar, &target.scalar) {
+            (Scalar::Signed(required), Scalar::Signed(existing)) => {
+                Scalar::Signed((*required).max(*existing))
+            }
+            (Scalar::Float(64), Scalar::Float(32)) => Scalar::Float(64),
+            (Scalar::Date32, Scalar::Date) => Scalar::Date32,
+            (Scalar::Decimal { .. }, Scalar::Decimal { precision, scale }) => {
+                let (required_precision, required_scale) = expected
+                    .decimal_requirement
+                    .ok_or("numeric requirements are missing")?;
+                let new_scale = (*scale).max(required_scale);
+                let integer_digits = (precision - scale).max(required_precision - required_scale);
+                let precision = integer_digits
+                    .checked_add(new_scale)
+                    .filter(|precision| *precision <= 76)
+                    .ok_or("no Decimal type retains both existing CH values and PG requirements")?;
+                Scalar::Decimal {
+                    precision: decimal_capacity(precision),
+                    scale: new_scale,
+                }
+            }
+            _ => return Err("no lossless ALTER rule for this type conversion".into()),
+        };
+    }
+    target.nullable |= source_nullable;
+    let mut definition = scalar_definition(&target.scalar);
+    if target.nullable {
+        definition = format!("Nullable({definition})");
+    }
+    if target.low_cardinality {
+        definition = format!("LowCardinality({definition})");
+    }
+    let comparison = compare_types(source, &definition);
+    if comparison.status > Status::Compatible {
+        return Err(comparison.message);
+    }
+    Ok(definition)
 }
 
 /// Compares a catalog-resolved PostgreSQL type with a ClickHouse type expression.
@@ -733,7 +796,7 @@ impl Parser<'_> {
 mod tests {
     use crate::model::{GeoMetadata, PgType, Status};
 
-    use super::{Scalar, compare_types, parse_target};
+    use super::{Scalar, alter_destination, compare_types, parse_target, same_target_type};
 
     fn pg(name: &str, typmod: i32) -> PgType {
         PgType {
@@ -769,6 +832,49 @@ mod tests {
                 "{source} -> {target}"
             );
         }
+    }
+
+    #[test]
+    fn alter_retains_existing_ch_capacity_and_wrappers() {
+        assert!(same_target_type("Decimal64(4)", "Decimal(18,4)"));
+        assert!(!same_target_type("Point", "Polygon"));
+        for (source, nullable, current, expected) in [
+            ("int4", true, "Int64", "Nullable(Int64)"),
+            ("int8", false, "Nullable(Int32)", "Nullable(Int64)"),
+            (
+                "text",
+                true,
+                "LowCardinality(String)",
+                "LowCardinality(Nullable(String))",
+            ),
+            ("float8", false, "Float32", "Float64"),
+            ("date", false, "Nullable(Date)", "Nullable(Date32)"),
+        ] {
+            assert_eq!(
+                alter_destination(&pg(source, -1), nullable, current).unwrap(),
+                expected
+            );
+        }
+        for (source, current) in [
+            ("int8", "UInt64"),
+            ("int4", "String"),
+            ("uuid", "String"),
+            ("timestamp", "DateTime64(0)"),
+        ] {
+            assert!(alter_destination(&pg(source, -1), false, current).is_err());
+        }
+        let modifier = |precision, scale| ((precision << 16) | scale) + 4;
+        assert_eq!(
+            alter_destination(&pg("numeric", modifier(12, 4)), false, "Decimal(9,2)").unwrap(),
+            "Decimal(18,4)"
+        );
+        assert_eq!(
+            alter_destination(&pg("numeric", modifier(18, 4)), false, "Decimal(18,2)").unwrap(),
+            "Decimal(38,4)"
+        );
+        assert!(
+            alter_destination(&pg("numeric", modifier(76, 10)), false, "Decimal(76,0)").is_err()
+        );
     }
 
     #[test]

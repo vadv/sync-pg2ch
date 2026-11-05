@@ -82,6 +82,22 @@ pub struct ComparisonConfig {
     pub ignore_target_columns: Vec<String>,
 }
 
+/// Deadline for a DDL request, including server-side mutation completion.
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ApplyConfig {
+    /// Maximum wait for one ALTER; timeout leaves its outcome indeterminate.
+    pub ddl_timeout_seconds: u64,
+}
+
+impl Default for ApplyConfig {
+    fn default() -> Self {
+        Self {
+            ddl_timeout_seconds: 300,
+        }
+    }
+}
+
 impl Default for ComparisonConfig {
     fn default() -> Self {
         Self {
@@ -106,6 +122,9 @@ pub struct Config {
     /// Comparison settings.
     #[serde(default)]
     pub comparison: ComparisonConfig,
+    /// DDL execution settings.
+    #[serde(default)]
+    pub apply: ApplyConfig,
 }
 
 impl Config {
@@ -132,6 +151,11 @@ impl Config {
     }
 
     fn validate(&mut self) -> Result<(), ConfigError> {
+        if !(1..=86400).contains(&self.apply.ddl_timeout_seconds) {
+            return Err(ConfigError(
+                "DDL timeout must be between 1 and 86400 seconds".into(),
+            ));
+        }
         if self.config_version != 1 {
             return Err(ConfigError(
                 "unsupported config_version (expected 1)".into(),

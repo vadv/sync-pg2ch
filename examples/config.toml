@@ -16,3 +16,6 @@ connect_timeout_seconds = 5
 query_timeout_seconds = 15
 
 ignore_target_columns = ["_peerdb_version", "_peerdb_is_deleted"]
+
+[apply]
+ddl_timeout_seconds = 300

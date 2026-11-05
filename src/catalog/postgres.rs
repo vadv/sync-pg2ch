@@ -178,6 +178,7 @@ impl PostgresCatalog {
             });
         }
         Ok(Some(PgTable {
+            oid,
             kind,
             persistence,
             columns,

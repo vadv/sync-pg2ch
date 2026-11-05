@@ -17,6 +17,9 @@ use url::Url;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
+#[path = "integration/ddl.rs"]
+mod ddl;
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Case {
@@ -258,9 +261,19 @@ impl Environment {
     }
 
     fn run(&self, config: &Path, format: &str, overrides: &[(&str, &str)]) -> TestResult<Output> {
+        self.run_command("diff", config, format, overrides)
+    }
+
+    fn run_command(
+        &self,
+        command_name: &str,
+        config: &Path,
+        format: &str,
+        overrides: &[(&str, &str)],
+    ) -> TestResult<Output> {
         let mut command = Command::new(env!("CARGO_BIN_EXE_sync-pg2ch"));
         command
-            .args(["diff", "--config"])
+            .args([command_name, "--config"])
             .arg(config)
             .args(["--format", format])
             .env("PG_URL", &self.pg_url)
@@ -448,6 +461,7 @@ async fn services_compatibility_matrix() -> TestResult {
     metadata_only(&environment).await?;
     numeric_boundaries(&environment).await?;
     catalog_failures(&environment).await?;
+    ddl::checks(&environment).await?;
     environment.cleanup().await
 }
 
@@ -1331,5 +1345,6 @@ async fn tls_certificate_validation() -> TestResult {
         &[("PG_URL", &pg_url), ("CH_URL", wrong_host_ch.as_str())],
     )?;
     environment.report("tls-hostname-ch", &output, "unknown")?;
+    ddl::tls_checks(&environment, &pg_url, &ch_url, &ca_cert).await?;
     environment.cleanup().await
 }

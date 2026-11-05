@@ -65,6 +65,8 @@ pub struct ChColumn {
 /// Metadata snapshot for a PostgreSQL relation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PgTable {
+    /// Catalog identity used to detect replacement of a relation with the same schema.
+    pub oid: i64,
     /// PostgreSQL `pg_class.relkind` value.
     pub kind: String,
     /// PostgreSQL `pg_class.relpersistence` value.

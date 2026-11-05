@@ -117,8 +117,12 @@ pub fn compare(pair: &TablePair, source: Option<&PgTable>, target: Option<&ChTab
             continue;
         }
         result.findings.push(column_finding(
-            "target_only_column", Status::Mismatch, None, Some(target), None,
-            "target-only column is outside the agreed column set; add an explicit ignore entry if intended".into(),
+            "target_only_column",
+            Status::Compatible,
+            None,
+            Some(target),
+            None,
+            "target-only column is retained; CDC writes source columns by name".into(),
         ));
     }
     finalize(&mut result);
@@ -353,6 +357,7 @@ mod tests {
 
     fn source(columns: Vec<PgColumn>) -> PgTable {
         PgTable {
+            oid: 1,
             kind: "r".into(),
             persistence: "p".into(),
             columns,
@@ -435,7 +440,7 @@ mod tests {
         let mut pair = pair();
         assert_eq!(
             compare(&pair, Some(&source), Some(&target)).status,
-            Status::Mismatch
+            Status::Compatible
         );
         pair.ignore_target_columns = vec!["_peerdb_version".into(), "not_present".into()];
         let result = compare(&pair, Some(&source), Some(&target));
@@ -451,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn target_only_default_materialized_and_nullable_columns_still_drift() {
+    fn target_only_default_materialized_and_nullable_columns_are_retained() {
         let source = source(vec![source_column("id", false)]);
         let mut columns = vec![target_column("id", "Int32")];
         for (name, kind, data_type) in [
@@ -464,7 +469,7 @@ mod tests {
             columns.push(column);
         }
         let result = compare(&pair(), Some(&source), Some(&target(columns)));
-        assert_eq!(result.status, Status::Mismatch);
+        assert_eq!(result.status, Status::Compatible);
         assert_eq!(result.findings.len(), 4);
         for finding in &result.findings[..3] {
             assert_eq!(finding.code, "target_only_column");

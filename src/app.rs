@@ -120,7 +120,7 @@ pub async fn run(config: &Config) -> Report {
     report
 }
 
-async fn bounded<T>(
+pub(crate) async fn bounded<T>(
     deadline: Duration,
     future: impl std::future::Future<Output = Result<T, CatalogError>>,
 ) -> Result<T, CatalogError> {
@@ -129,14 +129,14 @@ async fn bounded<T>(
         .map_err(|_| CatalogError::new("catalog_timeout", "catalog operation timed out"))?
 }
 
-#[derive(PartialEq, Eq)]
-struct Snapshot {
-    candidates: Vec<SourceTable>,
-    source: Option<PgTable>,
-    target: Option<ChTable>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Snapshot {
+    pub(crate) candidates: Vec<SourceTable>,
+    pub(crate) source: Option<PgTable>,
+    pub(crate) target: Option<ChTable>,
 }
 
-async fn read_snapshot(
+pub(crate) async fn read_snapshot(
     pg: &mut PostgresCatalog,
     ch: &ClickHouseCatalog,
     target: &TargetTable,
@@ -163,7 +163,11 @@ async fn read_snapshot(
     })
 }
 
-fn compare_snapshot(target: &TargetTable, snapshot: &Snapshot, config: &Config) -> TableDiff {
+pub(crate) fn compare_snapshot(
+    target: &TargetTable,
+    snapshot: &Snapshot,
+    config: &Config,
+) -> TableDiff {
     let source = match snapshot.candidates.as_slice() {
         [source] => source.clone(),
         [] => SourceTable {

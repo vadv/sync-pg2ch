@@ -16,7 +16,7 @@ use crate::{
 
 /// A ClickHouse client restricted to metadata queries by this adapter.
 pub struct ClickHouseCatalog {
-    client: Client,
+    pub(super) client: Client,
 }
 
 #[derive(Row, Deserialize)]
