@@ -95,7 +95,6 @@ jobs:
           PG_CONTAINER: ${{ job.services.postgres.id }}
           CH_CONTAINER: ${{ job.services.clickhouse.id }}
           TEST_PG_PORT: ${{ job.services.postgres.ports['5432'] }}
-          TEST_CH_HTTPS_PORT: ${{ job.services.clickhouse.ports['8443'] }}
         run: bash tests/fixtures/configure-tls.sh
       - name: Verify trusted, untrusted, and mismatched TLS certificates
         run: cargo +1.99.1 test --locked --features integration --test integration tls_certificate_validation -- --ignored --nocapture
@@ -108,6 +107,7 @@ jobs:
           mkdir -p artifacts
           docker logs "$PG_CONTAINER" > artifacts/postgres.log 2>&1
           docker logs "$CH_CONTAINER" > artifacts/clickhouse.log 2>&1
+          docker cp "$CH_CONTAINER:/var/log/clickhouse-server/clickhouse-server.err.log" artifacts/clickhouse-server.err.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:

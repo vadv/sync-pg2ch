@@ -4,7 +4,6 @@ set -euo pipefail
 : "${PG_CONTAINER:?PostgreSQL service container is required}"
 : "${CH_CONTAINER:?ClickHouse service container is required}"
 : "${TEST_PG_PORT:?PostgreSQL service port is required}"
-: "${TEST_CH_HTTPS_PORT:?ClickHouse HTTPS service port is required}"
 : "${GITHUB_ENV:?GitHub environment file is required}"
 
 tls_dir="$(mktemp -d)"
@@ -57,10 +56,14 @@ XML
 docker cp "$tls_dir/https.xml" "$CH_CONTAINER:/etc/clickhouse-server/config.d/test-https.xml"
 docker restart "$CH_CONTAINER"
 
+ch_http_port="$(docker inspect --format '{{(index (index .NetworkSettings.Ports "8123/tcp") 0).HostPort}}' "$CH_CONTAINER")"
+ch_https_port="$(docker inspect --format '{{(index (index .NetworkSettings.Ports "8443/tcp") 0).HostPort}}' "$CH_CONTAINER")"
+
 ready=false
 for attempt in $(seq 1 30); do
-  if curl --fail --silent --cacert "$tls_dir/ca.crt" \
-      "https://localhost:$TEST_CH_HTTPS_PORT/ping" > /dev/null; then
+  if curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
+      --cacert "$tls_dir/ca.crt" "https://localhost:$ch_https_port/ping" \
+      > /dev/null 2> "$tls_dir/readiness-error.log"; then
     ready=true
     break
   fi
@@ -68,9 +71,12 @@ for attempt in $(seq 1 30); do
 done
 if [ "$ready" != true ]; then
   echo 'ClickHouse HTTPS listener did not become ready' >&2
+  cat "$tls_dir/readiness-error.log" >&2
+  docker port "$CH_CONTAINER" >&2
   exit 1
 fi
 
 printf 'TEST_PG_TLS_URL=postgres://postgres:test-pass@localhost:%s/postgres?sslmode=verify-full&sslrootcert=%s/ca.crt\n' "$TEST_PG_PORT" "$tls_dir" >> "$GITHUB_ENV"
-printf 'TEST_CH_TLS_URL=https://localhost:%s\n' "$TEST_CH_HTTPS_PORT" >> "$GITHUB_ENV"
+printf 'CH_URL=http://localhost:%s\n' "$ch_http_port" >> "$GITHUB_ENV"
+printf 'TEST_CH_TLS_URL=https://localhost:%s\n' "$ch_https_port" >> "$GITHUB_ENV"
 printf 'TEST_CH_CA_CERT=%s/ca.crt\n' "$tls_dir" >> "$GITHUB_ENV"
