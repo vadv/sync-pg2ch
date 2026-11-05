@@ -144,7 +144,36 @@ impl ClickHouseCatalog {
         Ok(version)
     }
 
-    /// Read the engine and writable-column metadata of an explicitly selected table.
+    /// Discover all persistent objects in one database without filtering by engine.
+    ///
+    /// Unsupported objects remain visible so the comparator can report them as unknown.
+    pub async fn tables(&self, database: &str) -> Result<Vec<TargetTable>, CatalogError> {
+        let exists = self
+            .client
+            .query("SELECT name FROM system.databases WHERE name = ?")
+            .bind(database)
+            .fetch_optional::<String>()
+            .await
+            .map_err(CatalogError::ch)?;
+        if exists.is_none() {
+            return Err(CatalogError::new(
+                "clickhouse_database_missing",
+                "configured ClickHouse database does not exist",
+            ));
+        }
+        let names = self.client.query("SELECT name FROM system.tables WHERE database = ? AND is_temporary = 0 ORDER BY name")
+            .bind(database).fetch_all::<String>().await.map_err(CatalogError::ch)?;
+        let mut tables = Vec::with_capacity(names.len());
+        for name in names {
+            tables.push(TargetTable {
+                database: database.to_owned(),
+                table: name,
+            });
+        }
+        Ok(tables)
+    }
+
+    /// Read the engine and writable-column metadata of a discovered table.
     pub async fn table(&self, table: &TargetTable) -> Result<Option<ChTable>, CatalogError> {
         let engine = self
             .client

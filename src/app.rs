@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use crate::{
     catalog::{CatalogError, clickhouse::ClickHouseCatalog, postgres::PostgresCatalog},
-    config::{Config, TablePair, env_value},
+    config::{Config, SourceTable, TablePair, env_value},
     diff,
     model::{ChTable, Finding, PgTable, Status, TableDiff},
     report::Report,
@@ -56,11 +56,43 @@ pub async fn run(config: &Config) -> Report {
         report.finish();
         return report;
     }
-    let mut snapshots = Vec::with_capacity(config.tables.len());
-    for pair in &config.tables {
+    let targets = match bounded(
+        config.query_timeout(),
+        clickhouse.tables(&config.clickhouse.database),
+    )
+    .await
+    {
+        Ok(tables) if !tables.is_empty() => tables,
+        Ok(_) => {
+            report.errors.push(CatalogError::new(
+                "no_tables_discovered",
+                "configured ClickHouse database contains no persistent tables to compare",
+            ));
+            report.finish();
+            return report;
+        }
+        Err(error) => {
+            report.errors.push(error);
+            report.finish();
+            return report;
+        }
+    };
+    let mut pairs = Vec::with_capacity(targets.len());
+    for target in &targets {
+        pairs.push(TablePair {
+            source: SourceTable {
+                schema: config.postgres.schema.clone(),
+                table: target.table.clone(),
+            },
+            target: target.clone(),
+            ignore_target_columns: config.comparison.ignore_target_columns.clone(),
+        });
+    }
+    let mut snapshots = Vec::with_capacity(pairs.len());
+    for pair in &pairs {
         snapshots.push(read_pair(&mut postgres, &clickhouse, pair, config.query_timeout()).await);
     }
-    for (pair, snapshot) in config.tables.iter().zip(snapshots) {
+    for (pair, snapshot) in pairs.iter().zip(snapshots) {
         let (source, target) = match snapshot {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -85,6 +117,11 @@ pub async fn run(config: &Config) -> Report {
             report.errors.push(error);
         }
         report.tables.push(result);
+    }
+    match bounded(config.query_timeout(), clickhouse.tables(&config.clickhouse.database)).await {
+        Ok(tables) if tables == targets => {}
+        Ok(_) => report.errors.push(CatalogError::new("table_set_changed_during_check", "the set of ClickHouse tables changed during discovery and comparison; rerun after DDL completes")),
+        Err(error) => report.errors.push(error),
     }
     report.finish();
     report

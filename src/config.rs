@@ -1,4 +1,4 @@
-//! Versioned configuration and explicit source/target table mappings.
+//! Versioned connection, discovery and comparison configuration.
 use std::{collections::BTreeSet, path::Path, time::Duration};
 
 use serde::{Deserialize, Serialize};
@@ -28,7 +28,7 @@ pub struct TargetTable {
     pub table: String,
 }
 
-/// A selected pair of tables and explicitly excluded target columns.
+/// An internally resolved table pair and explicitly excluded target columns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TablePair {
@@ -47,6 +47,9 @@ pub struct TablePair {
 pub struct PostgresConfig {
     /// Name of the environment variable containing a PostgreSQL URL.
     pub url_env: String,
+    /// Namespace in which to resolve discovered ClickHouse table names.
+    #[serde(default = "default_schema")]
+    pub schema: String,
 }
 
 /// ClickHouse HTTP connection environment references.
@@ -55,6 +58,8 @@ pub struct PostgresConfig {
 pub struct ClickHouseConfig {
     /// Environment variable containing an HTTP(S) endpoint.
     pub url_env: String,
+    /// Database whose persistent tables define the comparison scope.
+    pub database: String,
     /// Optional environment variable containing the user name.
     pub user_env: Option<String>,
     /// Optional environment variable containing the password.
@@ -73,6 +78,8 @@ pub struct ComparisonConfig {
     pub connect_timeout_seconds: u64,
     /// Deadline for reading a table's metadata in seconds.
     pub query_timeout_seconds: u64,
+    /// Target-only columns excluded from every discovered table.
+    pub ignore_target_columns: Vec<String>,
 }
 
 impl Default for ComparisonConfig {
@@ -81,6 +88,7 @@ impl Default for ComparisonConfig {
             policy: "pg-clickhouse-v1".into(),
             connect_timeout_seconds: 5,
             query_timeout_seconds: 15,
+            ignore_target_columns: Vec::new(),
         }
     }
 }
@@ -98,8 +106,6 @@ pub struct Config {
     /// Comparison settings.
     #[serde(default)]
     pub comparison: ComparisonConfig,
-    /// Explicit table pairs, sorted during validation.
-    pub tables: Vec<TablePair>,
 }
 
 impl Config {
@@ -153,33 +159,23 @@ impl Config {
         {
             validate_env_name(name)?;
         }
-        if self.tables.is_empty() {
-            return Err(ConfigError("at least one table pair is required".into()));
+        validate_identifier(&self.postgres.schema)?;
+        validate_identifier(&self.clickhouse.database)?;
+        if ["system", "information_schema", "INFORMATION_SCHEMA"]
+            .contains(&self.clickhouse.database.as_str())
+        {
+            return Err(ConfigError(
+                "select a user ClickHouse database for discovery".into(),
+            ));
         }
-        let mut targets = BTreeSet::new();
-        for pair in &mut self.tables {
-            for name in [
-                &pair.source.schema,
-                &pair.source.table,
-                &pair.target.database,
-                &pair.target.table,
-            ] {
-                validate_identifier(name)?;
+        let mut ignored = BTreeSet::new();
+        for column in &self.comparison.ignore_target_columns {
+            validate_identifier(column)?;
+            if !ignored.insert(column) {
+                return Err(ConfigError("duplicate ignored target column".into()));
             }
-            if !targets.insert(pair.target.clone()) {
-                return Err(ConfigError("duplicate target table mapping".into()));
-            }
-            let mut ignored = BTreeSet::new();
-            for column in &pair.ignore_target_columns {
-                validate_identifier(column)?;
-                if !ignored.insert(column) {
-                    return Err(ConfigError("duplicate ignored target column".into()));
-                }
-            }
-            pair.ignore_target_columns.sort();
         }
-        self.tables
-            .sort_by(|a, b| (&a.source, &a.target).cmp(&(&b.source, &b.target)));
+        self.comparison.ignore_target_columns.sort();
         Ok(())
     }
 
@@ -192,6 +188,10 @@ impl Config {
     pub fn query_timeout(&self) -> Duration {
         Duration::from_secs(self.comparison.query_timeout_seconds)
     }
+}
+
+fn default_schema() -> String {
+    "public".into()
 }
 
 fn validate_env_name(name: &str) -> Result<(), ConfigError> {
@@ -232,15 +232,14 @@ config_version = 1
 url_env = "PG_URL"
 [clickhouse]
 url_env = "CH_URL"
-[[tables]]
-source = { schema = "public", table = "a.b" }
-target = { database = "default", table = "a.b" }
+database = "analytics.with.dot"
 "#;
 
     #[test]
     fn names_are_not_split_and_defaults_are_explicit() {
         let config = Config::parse(CONFIG).unwrap();
-        assert_eq!(config.tables[0].source.table, "a.b");
+        assert_eq!(config.postgres.schema, "public");
+        assert_eq!(config.clickhouse.database, "analytics.with.dot");
         assert_eq!(config.query_timeout(), Duration::from_secs(15));
     }
 
@@ -249,11 +248,18 @@ target = { database = "default", table = "a.b" }
         for text in [
             CONFIG.replace("config_version = 1", "config_version = 2"),
             CONFIG.replace("url_env = \"PG_URL\"", "url = \"secret\""),
-            CONFIG.replace("schema = \"public\"", "schema = \"\""),
+            CONFIG.replace("database = \"analytics.with.dot\"", "database = \"\""),
+            CONFIG.replace("database = \"analytics.with.dot\"", "database = \"system\""),
+            CONFIG.replace("database = \"analytics.with.dot\"", ""),
+            CONFIG.replace(
+                "url_env = \"PG_URL\"",
+                "url_env = \"PG_URL\"\nschema = \"\"",
+            ),
             format!(
-                "{CONFIG}\n[[tables]]\nsource = {{schema=\"other\",table=\"x\"}}\ntarget = {{database=\"default\",table=\"a.b\"}}"
+                "{CONFIG}\n[[tables]]\nsource = {{schema=\"public\",table=\"a\"}}\ntarget = {{database=\"default\",table=\"a\"}}"
             ),
             format!("{CONFIG}\n[comparison]\nquery_timeout_seconds = 0"),
+            format!("{CONFIG}\n[comparison]\nignore_target_columns = ['v', 'v']"),
         ] {
             assert!(Config::parse(&text).is_err());
         }

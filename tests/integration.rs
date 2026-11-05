@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -215,21 +216,38 @@ impl Environment {
         Ok(())
     }
 
-    fn config(&self, name: &str, cases: &[&Case], ca_cert: Option<&Path>) -> TestResult<PathBuf> {
-        let mut tables = Vec::new();
+    async fn config(
+        &self,
+        name: &str,
+        cases: &[&Case],
+        ca_cert: Option<&Path>,
+    ) -> TestResult<PathBuf> {
+        let database = format!("{}__{name}", self.database);
+        self.ch
+            .query(&format!("CREATE DATABASE {}", identifier(&database)))
+            .execute()
+            .await?;
+        let mut ignored = BTreeSet::new();
         for case in cases {
-            tables.push(json!({
-                "source": { "schema": self.schema, "table": case.name },
-                "target": { "database": self.database, "table": case.name },
-                "ignore_target_columns": case.ignore
-            }));
+            self.ch
+                .query(&format!(
+                    "CREATE TABLE {}.{} AS {}.{}",
+                    identifier(&database),
+                    identifier(&case.name),
+                    identifier(&self.database),
+                    identifier(&case.name)
+                ))
+                .execute()
+                .await?;
+            for column in &case.ignore {
+                ignored.insert(column);
+            }
         }
         let mut config = json!({
             "config_version": 1,
-            "postgres": { "url_env": "PG_URL" },
-            "clickhouse": { "url_env": "CH_URL", "user_env": "CH_USER", "password_env": "CH_PASSWORD" },
-            "comparison": { "policy": "pg-clickhouse-v1", "connect_timeout_seconds": 5, "query_timeout_seconds": 15 },
-            "tables": tables
+            "postgres": { "url_env": "PG_URL", "schema": self.schema },
+            "clickhouse": { "url_env": "CH_URL", "database": database, "user_env": "CH_USER", "password_env": "CH_PASSWORD" },
+            "comparison": { "policy": "pg-clickhouse-v1", "connect_timeout_seconds": 5, "query_timeout_seconds": 15, "ignore_target_columns": ignored }
         });
         if let Some(ca_cert) = ca_cert {
             config["clickhouse"]["ca_cert"] = json!(ca_cert);
@@ -293,10 +311,19 @@ impl Environment {
     }
 
     async fn cleanup(self) -> TestResult {
-        self.ch
-            .query(&format!("DROP DATABASE {}", identifier(&self.database)))
-            .execute()
+        let databases: Vec<String> = self
+            .ch
+            .query("SELECT name FROM system.databases WHERE name = ? OR startsWith(name, ?)")
+            .bind(&self.database)
+            .bind(format!("{}__", self.database))
+            .fetch_all()
             .await?;
+        for database in databases {
+            self.ch
+                .query(&format!("DROP DATABASE {}", identifier(&database)))
+                .execute()
+                .await?;
+        }
         self.pg.close().await;
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "DROP DATABASE {}",
@@ -314,6 +341,12 @@ fn assert_cases(report: &Value, cases: &[&Case]) {
         .as_array()
         .expect("tables must be an array");
     assert_eq!(tables.len(), cases.len());
+    let mut ignored = BTreeSet::new();
+    for case in cases {
+        for column in &case.ignore {
+            ignored.insert(column);
+        }
+    }
     let mut previous = "";
     for table in tables {
         let name = table["source"]["table"]
@@ -335,7 +368,7 @@ fn assert_cases(report: &Value, cases: &[&Case]) {
         assert_eq!(table["status"], case.status, "{}: {table}", case.name);
         assert_eq!(
             table["ignored_target_columns"],
-            json!(case.ignore),
+            json!(ignored),
             "{}",
             case.name
         );
@@ -384,7 +417,7 @@ async fn services_compatibility_matrix() -> TestResult {
             }
         }
         assert!(!cases.is_empty(), "empty fixture group {status}");
-        let config = environment.config(status, &cases, None)?;
+        let config = environment.config(status, &cases, None).await?;
         let output = environment.run(&config, "json", &[])?;
         let report = environment.report(status, &output, status)?;
         assert_cases(&report, &cases);
@@ -404,14 +437,15 @@ async fn services_compatibility_matrix() -> TestResult {
             }
         }
     }
-    let config = environment.config("mixed", &mixed, None)?;
+    let config = environment.config("mixed", &mixed, None).await?;
     let output = environment.run(&config, "json", &[])?;
     let report = environment.report("mixed", &output, "unknown")?;
     assert_cases(&report, &mixed);
     cli_errors(&environment).await?;
+    automatic_discovery(&environment).await?;
     metadata_only(&environment).await?;
     numeric_boundaries(&environment).await?;
-    catalog_failures(&environment)?;
+    catalog_failures(&environment).await?;
     environment.cleanup().await
 }
 
@@ -510,7 +544,7 @@ fn mock_catalog(replies: Vec<MockReply>) -> TestResult<(String, thread::JoinHand
     Ok((endpoint, server))
 }
 
-fn catalog_failures(environment: &Environment) -> TestResult {
+async fn catalog_failures(environment: &Environment) -> TestResult {
     let mut source = None;
     for case in &environment.cases {
         if case.name == "bigint" {
@@ -519,11 +553,13 @@ fn catalog_failures(environment: &Environment) -> TestResult {
         }
     }
     let source = source.expect("bigint fixture is required by catalog failure tests");
-    let config = environment.config("catalog-race", &[source], None)?;
+    let config = environment.config("catalog-race", &[source], None).await?;
     let (endpoint, server) = mock_catalog(vec![
         MockReply::row("SELECT version()", &["26.8.36.3"]),
         MockReply::grant("CHECK GRANT SHOW TABLES"),
         MockReply::grant("CHECK GRANT SHOW COLUMNS"),
+        MockReply::row("SELECT name FROM system.databases", &["catalog-race"]),
+        MockReply::row("SELECT name FROM system.tables", &["bigint"]),
         MockReply::row("SELECT engine FROM system.tables", &["MergeTree"]),
         MockReply::row(
             "SELECT name, type, default_kind FROM system.columns",
@@ -534,6 +570,8 @@ fn catalog_failures(environment: &Environment) -> TestResult {
             "SELECT name, type, default_kind FROM system.columns",
             &["v", "Int64", ""],
         ),
+        MockReply::row("SELECT name FROM system.databases", &["catalog-race"]),
+        MockReply::row("SELECT name FROM system.tables", &["bigint"]),
     ])?;
     let output = environment.run(&config, "json", &[("CH_URL", &endpoint)])?;
     server
@@ -555,6 +593,37 @@ fn catalog_failures(environment: &Environment) -> TestResult {
     }
     assert!(observed_race, "missing DDL race finding: {report}");
     assert!(preserved_diff, "original diff was discarded: {report}");
+    for names in [vec!["bigint", "new_table"], Vec::new()] {
+        let (endpoint, server) = mock_catalog(vec![
+            MockReply::row("SELECT version()", &["26.8.36.3"]),
+            MockReply::grant("CHECK GRANT SHOW TABLES"),
+            MockReply::grant("CHECK GRANT SHOW COLUMNS"),
+            MockReply::row("SELECT name FROM system.databases", &["catalog-race"]),
+            MockReply::row("SELECT name FROM system.tables", &["bigint"]),
+            MockReply::row("SELECT engine FROM system.tables", &["MergeTree"]),
+            MockReply::row(
+                "SELECT name, type, default_kind FROM system.columns",
+                &["v", "Int64", ""],
+            ),
+            MockReply::row("SELECT engine FROM system.tables", &["MergeTree"]),
+            MockReply::row(
+                "SELECT name, type, default_kind FROM system.columns",
+                &["v", "Int64", ""],
+            ),
+            MockReply::row("SELECT name FROM system.databases", &["catalog-race"]),
+            MockReply::row("SELECT name FROM system.tables", &names),
+        ])?;
+        let output = environment.run(&config, "json", &[("CH_URL", &endpoint)])?;
+        server
+            .join()
+            .map_err(|_| "mock discovery server panicked")??;
+        let report = environment.report("discovery-race", &output, "unknown")?;
+        assert_eq!(
+            report["errors"][0]["code"],
+            "table_set_changed_during_check"
+        );
+        assert_eq!(report["tables"][0]["status"], "match");
+    }
     let mut value: toml::Value = toml::from_str(&fs::read_to_string(&config)?)?;
     value["comparison"]["query_timeout_seconds"] = toml::Value::Integer(1);
     fs::write(&config, toml::to_string(&value)?)?;
@@ -580,7 +649,7 @@ fn catalog_failures(environment: &Environment) -> TestResult {
 
 async fn cli_errors(environment: &Environment) -> TestResult {
     let cases = [&environment.cases[0]];
-    let config = environment.config("single", &cases, None)?;
+    let config = environment.config("single", &cases, None).await?;
     let output = environment.run(&config, "text", &[])?;
     assert_eq!(output.status.code(), Some(0));
     assert!(!output.stdout.is_empty());
@@ -588,15 +657,21 @@ async fn cli_errors(environment: &Environment) -> TestResult {
     environment.report("bad-credentials", &output, "unknown")?;
     assert!(!String::from_utf8_lossy(&output.stdout).contains("wrong-password-marker"));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("wrong-password-marker"));
-    let empty = environment.config("empty", &[], None)?;
-    assert_eq!(environment.run(&empty, "json", &[])?.status.code(), Some(2));
-    let duplicate = environment.config("duplicate", &[cases[0], cases[0]], None)?;
-    assert_eq!(
-        environment.run(&duplicate, "json", &[])?.status.code(),
-        Some(2)
-    );
+    let empty = environment.config("empty", &[], None).await?;
+    let report = environment.report("empty", &environment.run(&empty, "json", &[])?, "unknown")?;
+    assert_eq!(report["errors"][0]["code"], "no_tables_discovered");
+    let mut missing_db: toml::Value = toml::from_str(&fs::read_to_string(&empty)?)?;
+    missing_db["clickhouse"]["database"] =
+        toml::Value::String(format!("{}__does_not_exist", environment.database));
+    fs::write(&empty, toml::to_string(&missing_db)?)?;
+    let report = environment.report(
+        "missing-database",
+        &environment.run(&empty, "json", &[])?,
+        "unknown",
+    )?;
+    assert_eq!(report["errors"][0]["code"], "clickhouse_database_missing");
     let mut config_value: toml::Value = toml::from_str(&fs::read_to_string(&config)?)?;
-    config_value["tables"][0]["ignore_target_columns"] =
+    config_value["comparison"]["ignore_target_columns"] =
         toml::Value::Array(vec![toml::Value::String("v".to_owned())]);
     let conflict = environment.files.path().join("ignore-conflict.toml");
     fs::write(&conflict, toml::to_string(&config_value)?)?;
@@ -616,13 +691,100 @@ async fn cli_errors(environment: &Environment) -> TestResult {
         code: None,
         geo: None,
     };
-    let config = environment.config("missing", &[cases[0], &missing], None)?;
+    environment
+        .ch
+        .query(&format!(
+            "CREATE TABLE {}.{} (v Int32) ENGINE=MergeTree ORDER BY tuple()",
+            identifier(&environment.database),
+            identifier(&missing.name)
+        ))
+        .execute()
+        .await?;
+    let config = environment
+        .config("missing", &[cases[0], &missing], None)
+        .await?;
     let report = environment.report(
         "missing",
         &environment.run(&config, "json", &[])?,
         "mismatch",
     )?;
     assert_cases(&report, &[cases[0], &missing]);
+    Ok(())
+}
+
+async fn automatic_discovery(environment: &Environment) -> TestResult {
+    let config = environment
+        .config("automatic", &[&environment.cases[0]], None)
+        .await?;
+    let contents = fs::read_to_string(&config)?;
+    let settings: toml::Value = toml::from_str(&contents)?;
+    assert!(settings.get("tables").is_none());
+    let database = settings["clickhouse"]["database"]
+        .as_str()
+        .expect("discovery database");
+    let output = environment.run(&config, "json", &[])?;
+    let report = environment.report("automatic-before", &output, "match")?;
+    assert_eq!(report["tables"].as_array().expect("tables").len(), 1);
+
+    let name = "event.\"Юникод";
+    let pg_table = format!("{}.{}", identifier(&environment.schema), identifier(name));
+    let ch_table = format!("{}.{}", identifier(database), identifier(name));
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE {pg_table} (v integer NOT NULL)"
+    )))
+    .execute(&environment.pg)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE {}.pg_only (v integer NOT NULL)",
+        identifier(&environment.schema)
+    )))
+    .execute(&environment.pg)
+    .await?;
+    environment
+        .ch
+        .query(&format!(
+            "CREATE TABLE {ch_table} (v Int32) ENGINE=MergeTree ORDER BY tuple()"
+        ))
+        .execute()
+        .await?;
+    let output = environment.run(&config, "json", &[])?;
+    let report = environment.report("automatic-after", &output, "match")?;
+    assert_eq!(report["tables"].as_array().expect("tables").len(), 2);
+    assert_eq!(report["tables"][0]["source"]["table"], name);
+    assert_eq!(report["tables"][0]["source"]["schema"], environment.schema);
+    assert_eq!(report["tables"][0]["target"]["database"], database);
+    assert_eq!(contents, fs::read_to_string(&config)?);
+
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE {pg_table} SET SCHEMA public"
+    )))
+    .execute(&environment.pg)
+    .await?;
+    let report = environment.report(
+        "automatic-wrong-source-schema",
+        &environment.run(&config, "json", &[])?,
+        "mismatch",
+    )?;
+    assert_eq!(
+        report["tables"][0]["findings"][0]["code"],
+        "source_table_missing"
+    );
+
+    environment
+        .ch
+        .query(&format!(
+            "CREATE VIEW {}.unsupported_view AS SELECT toInt32(1) AS v",
+            identifier(database)
+        ))
+        .execute()
+        .await?;
+    let report = environment.report(
+        "automatic-unsupported-object",
+        &environment.run(&config, "json", &[])?,
+        "unknown",
+    )?;
+    assert_eq!(report["tables"].as_array().expect("tables").len(), 3);
+    assert_eq!(report["tables"][2]["status"], "unknown");
     Ok(())
 }
 
@@ -719,7 +881,9 @@ async fn metadata_only(environment: &Environment) -> TestResult {
         .await
         .is_err()
     );
-    let config = environment.config("metadata-only", &[&environment.cases[0]], None)?;
+    let config = environment
+        .config("metadata-only", &[&environment.cases[0]], None)
+        .await?;
     let output = environment.run(
         &config,
         "json",
@@ -858,16 +1022,21 @@ async fn tls_certificate_validation() -> TestResult {
     pg_url.set_path(&environment.database);
     let pg_url = pg_url.to_string();
     let ch_url = required_env("TEST_CH_TLS_URL")?;
-    let config = environment.config("tls", &[&environment.cases[0]], Some(&ca_cert))?;
+    let config = environment
+        .config("tls", &[&environment.cases[0]], Some(&ca_cert))
+        .await?;
     let output = environment.run(&config, "json", &[("PG_URL", &pg_url), ("CH_URL", &ch_url)])?;
     environment.report("tls-trusted", &output, "match")?;
-    let config = environment.config("tls-untrusted-ch", &[&environment.cases[0]], None)?;
+    let config = environment
+        .config("tls-untrusted-ch", &[&environment.cases[0]], None)
+        .await?;
     let output = environment.run(&config, "json", &[("PG_URL", &pg_url), ("CH_URL", &ch_url)])?;
     environment.report("tls-untrusted-ch", &output, "unknown")?;
     let mut untrusted_pg = Url::parse(&pg_url)?;
     untrusted_pg.set_query(Some("sslmode=verify-full"));
-    let config =
-        environment.config("tls-untrusted-pg", &[&environment.cases[0]], Some(&ca_cert))?;
+    let config = environment
+        .config("tls-untrusted-pg", &[&environment.cases[0]], Some(&ca_cert))
+        .await?;
     let output = environment.run(
         &config,
         "json",

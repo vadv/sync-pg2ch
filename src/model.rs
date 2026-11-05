@@ -127,12 +127,12 @@ pub struct Finding {
     pub message: String,
 }
 
-/// Deterministic comparison result for one configured pair of tables.
+/// Deterministic comparison result for one discovered pair of tables.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TableDiff {
-    /// Configured PostgreSQL source identity.
+    /// Resolved PostgreSQL source identity.
     pub source: crate::config::SourceTable,
-    /// Configured ClickHouse target identity.
+    /// Discovered ClickHouse target identity.
     pub target: crate::config::TargetTable,
     /// Highest severity among findings for this pair.
     pub status: Status,

@@ -19,9 +19,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Compare explicitly mapped tables; never generate or execute migrations.
+    /// Discover ClickHouse tables and compare them with PostgreSQL; never run migrations.
     Diff {
-        /// TOML configuration with connection environment references and table pairs.
+        /// TOML configuration with connections, a ClickHouse database and a PostgreSQL schema.
         #[arg(short, long)]
         config: PathBuf,
         /// Output format. JSON includes matching columns and source geo metadata.

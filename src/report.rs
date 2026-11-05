@@ -49,7 +49,7 @@ pub struct Report {
     pub counts: Counts,
     /// Server and extension versions.
     pub servers: Servers,
-    /// Table results in deterministic configuration order.
+    /// Discovered table results in deterministic identifier order.
     pub tables: Vec<TableDiff>,
     /// Operational diagnostics without driver messages or secrets.
     pub errors: Vec<CatalogError>,
