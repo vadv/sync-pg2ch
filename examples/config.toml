@@ -1,0 +1,19 @@
+config_version = 1
+
+[postgres]
+url_env = "PG_URL"
+
+[clickhouse]
+url_env = "CH_URL"
+user_env = "CH_USER"
+password_env = "CH_PASSWORD"
+
+[comparison]
+policy = "pg-clickhouse-v1"
+connect_timeout_seconds = 5
+query_timeout_seconds = 15
+
+[[tables]]
+source = { schema = "public", table = "events" }
+target = { database = "analytics", table = "events" }
+ignore_target_columns = ["_peerdb_version", "_peerdb_is_deleted"]

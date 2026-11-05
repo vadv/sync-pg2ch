@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+      - name: Check formatting
+        run: cargo +1.99.1 fmt --all -- --check
+      - name: Clippy
+        run: cargo +1.99.1 clippy --locked --all-targets --all-features -- -D warnings
+      - name: Unit tests
+        run: cargo +1.99.1 test --locked --lib --bins
+
+  compatibility:
+    name: PostgreSQL ${{ matrix.variant }} and ClickHouse 26.8 LTS
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: "14"
+            postgres_image: postgres:14.24-bookworm@sha256:a389ed49344afc8f4444efd4eb512965df07aaa6ed84b239b54a23246e9fe347
+            postgis: "false"
+          - variant: "14 + PostGIS 3.6"
+            postgres_image: postgis/postgis:14-3.6@sha256:fdf13349aac39b694214d1f323eab3b9ae9a624e2efb582a4c8d3debb1d0b817
+            postgis: "true"
+    services:
+      postgres:
+        image: ${{ matrix.postgres_image }}
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: test-pass
+          POSTGRES_DB: postgres
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+      clickhouse:
+        image: clickhouse:26.8.36.3-jammy@sha256:1201467edf24c3a40c5670aceaece9b51479fbd65e8aeea22e246d5816a322ea
+        env:
+          CLICKHOUSE_USER: default
+          CLICKHOUSE_PASSWORD: test-pass
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+        ports:
+          - 8123/tcp
+          - 8443/tcp
+        options: >-
+          --ulimit nofile=262144:262144
+          --health-cmd "clickhouse-client --user default --password test-pass --query 'SELECT 1'"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      CH_USER: default
+      CH_PASSWORD: test-pass
+      TEST_POSTGIS: ${{ matrix.postgis }}
+      TEST_ARTIFACTS: artifacts
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set service endpoints
+        env:
+          TEST_PG_URL: postgres://postgres:test-pass@localhost:${{ job.services.postgres.ports['5432'] }}/postgres?sslmode=disable
+          TEST_CH_URL: http://localhost:${{ job.services.clickhouse.ports['8123'] }}
+        run: |
+          printf 'PG_URL=%s\n' "$TEST_PG_URL" >> "$GITHUB_ENV"
+          printf 'CH_URL=%s\n' "$TEST_CH_URL" >> "$GITHUB_ENV"
+      - name: Install Rust
+        run: rustup toolchain install 1.99.1 --profile minimal
+      - name: Record service images
+        env:
+          PG_CONTAINER: ${{ job.services.postgres.id }}
+          CH_CONTAINER: ${{ job.services.clickhouse.id }}
+        run: |
+          mkdir -p artifacts
+          docker inspect --format '{{.Config.Image}} {{.Image}}' "$PG_CONTAINER" "$CH_CONTAINER" > artifacts/images.txt
+      - name: Run compatibility matrix
+        run: cargo +1.99.1 test --locked --features integration --test integration -- --nocapture
+      - name: Configure TLS services
+        env:
+          PG_CONTAINER: ${{ job.services.postgres.id }}
+          CH_CONTAINER: ${{ job.services.clickhouse.id }}
+          TEST_PG_PORT: ${{ job.services.postgres.ports['5432'] }}
+          TEST_CH_HTTPS_PORT: ${{ job.services.clickhouse.ports['8443'] }}
+        run: bash tests/fixtures/configure-tls.sh
+      - name: Verify trusted, untrusted, and mismatched TLS certificates
+        run: cargo +1.99.1 test --locked --features integration --test integration tls_certificate_validation -- --ignored --nocapture
+      - name: Collect logs
+        if: always()
+        env:
+          PG_CONTAINER: ${{ job.services.postgres.id }}
+          CH_CONTAINER: ${{ job.services.clickhouse.id }}
+        run: |
+          mkdir -p artifacts
+          docker logs "$PG_CONTAINER" > artifacts/postgres.log 2>&1
+          docker logs "$CH_CONTAINER" > artifacts/clickhouse.log 2>&1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compatibility-postgis-${{ matrix.postgis }}
+          path: artifacts/
+          retention-days: 7
