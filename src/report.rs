@@ -58,7 +58,7 @@ pub struct Report {
 impl Default for Report {
     fn default() -> Self {
         Self {
-            report_version: 2,
+            report_version: 1,
             policy: "pg-clickhouse-v1",
             policy_limitations: vec![
                 "Only schema metadata is checked; row values and CDC serialization are not validated.",
@@ -216,7 +216,7 @@ mod tests {
         let mut output = Vec::new();
         report.write_json(&mut output).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
-        assert_eq!(json["report_version"], 2);
+        assert_eq!(json["report_version"], 1);
         assert_eq!(json["status"], "unknown");
     }
 }

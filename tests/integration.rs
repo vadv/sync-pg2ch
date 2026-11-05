@@ -293,7 +293,7 @@ impl Environment {
             String::from_utf8_lossy(&output.stdout)
         );
         let report: Value = serde_json::from_slice(&output.stdout)?;
-        assert_eq!(report["report_version"], 2, "{name}");
+        assert_eq!(report["report_version"], 1, "{name}");
         assert_eq!(report["policy"], "pg-clickhouse-v1", "{name}");
         assert_eq!(report["status"], status, "{name}");
         assert_eq!(report["complete"], status != "unknown", "{name}");
