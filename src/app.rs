@@ -77,6 +77,16 @@ pub async fn run(config: &Config) -> Report {
             return report;
         }
     };
+    let (targets, skipped) = crate::discovery::select(targets, &config.discovery);
+    report.skipped_tables = skipped;
+    if targets.is_empty() {
+        report.errors.push(CatalogError::new(
+            "no_tables_selected",
+            "all discovered ClickHouse tables were excluded",
+        ));
+        report.finish();
+        return report;
+    }
     let mut snapshots = Vec::with_capacity(targets.len());
     for target in &targets {
         snapshots.push(read_snapshot(&mut postgres, &clickhouse, target, config).await);
@@ -111,7 +121,7 @@ pub async fn run(config: &Config) -> Report {
         }
         report.tables.push(result);
     }
-    match bounded(config.query_timeout(), clickhouse.tables(&config.clickhouse.database)).await {
+    match bounded(config.query_timeout(), clickhouse.tables(&config.clickhouse.database)).await.map(|tables| crate::discovery::select(tables, &config.discovery).0) {
         Ok(tables) if tables == targets => {}
         Ok(_) => report.errors.push(CatalogError::new("table_set_changed_during_check", "the set of ClickHouse tables changed during discovery and comparison; rerun after DDL completes")),
         Err(error) => report.errors.push(error),
@@ -222,6 +232,7 @@ fn failed_table(target: &TargetTable, config: &Config, error: &CatalogError) -> 
         source: None,
         source_candidates: Vec::new(),
         target: target.clone(),
+        default_timezone: None,
         status: Status::Unknown,
         findings: vec![error_finding(error)],
         ignored_target_columns: config.comparison.ignore_target_columns.clone(),

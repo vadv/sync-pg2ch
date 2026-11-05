@@ -26,6 +26,12 @@ struct ColumnRow {
     default_kind: String,
 }
 
+#[derive(Row, Deserialize)]
+struct TableRow {
+    engine: String,
+    default_timezone: String,
+}
+
 impl ClickHouseCatalog {
     /// Construct an HTTP client with a connection deadline and optional private CA.
     pub fn new(config: &ClickHouseConfig, deadline: Duration) -> Result<Self, CatalogError> {
@@ -123,7 +129,7 @@ impl ClickHouseCatalog {
             .query("SELECT version()")
             .fetch_one::<String>()
             .await
-            .map_err(CatalogError::ch)?;
+            .map_err(|error| CatalogError::ch(error).during("reading ClickHouse version"))?;
         for query in [
             "CHECK GRANT SHOW TABLES ON *.*",
             "CHECK GRANT SHOW COLUMNS ON *.*",
@@ -133,7 +139,7 @@ impl ClickHouseCatalog {
                 .query(query)
                 .fetch_one::<u8>()
                 .await
-                .map_err(CatalogError::ch)?;
+                .map_err(|error| CatalogError::ch(error).during("checking metadata visibility"))?;
             if visible == 0 {
                 return Err(CatalogError::new(
                     "clickhouse_metadata_visibility",
@@ -154,7 +160,7 @@ impl ClickHouseCatalog {
             .bind(database)
             .fetch_optional::<String>()
             .await
-            .map_err(CatalogError::ch)?;
+            .map_err(|error| CatalogError::ch(error).during("finding ClickHouse database"))?;
         if exists.is_none() {
             return Err(CatalogError::new(
                 "clickhouse_database_missing",
@@ -162,7 +168,7 @@ impl ClickHouseCatalog {
             ));
         }
         let names = self.client.query("SELECT name FROM system.tables WHERE database = ? AND is_temporary = 0 ORDER BY name")
-            .bind(database).fetch_all::<String>().await.map_err(CatalogError::ch)?;
+            .bind(database).fetch_all::<String>().await.map_err(|error| CatalogError::ch(error).during("discovering ClickHouse tables"))?;
         let mut tables = Vec::with_capacity(names.len());
         for name in names {
             tables.push(TargetTable {
@@ -177,17 +183,21 @@ impl ClickHouseCatalog {
     pub async fn table(&self, table: &TargetTable) -> Result<Option<ChTable>, CatalogError> {
         let engine = self
             .client
-            .query("SELECT engine FROM system.tables WHERE database = ? AND name = ?")
+            .query("SELECT engine, timezone() AS default_timezone FROM system.tables WHERE database = ? AND name = ?")
             .bind(&table.database)
             .bind(&table.table)
-            .fetch_optional::<String>()
+            .fetch_optional::<TableRow>()
             .await
-            .map_err(CatalogError::ch)?;
-        let Some(engine) = engine else {
+            .map_err(|error| CatalogError::ch(error).during("reading ClickHouse table and timezone"))?;
+        let Some(TableRow {
+            engine,
+            default_timezone,
+        }) = engine
+        else {
             return Ok(None);
         };
         let rows = self.client.query("SELECT name, type, default_kind FROM system.columns WHERE database = ? AND table = ? ORDER BY name")
-            .bind(&table.database).bind(&table.table).fetch_all::<ColumnRow>().await.map_err(CatalogError::ch)?;
+            .bind(&table.database).bind(&table.table).fetch_all::<ColumnRow>().await.map_err(|error| CatalogError::ch(error).during("reading ClickHouse columns"))?;
         let mut columns = Vec::with_capacity(rows.len());
         for ColumnRow {
             name,
@@ -201,6 +211,10 @@ impl ClickHouseCatalog {
                 default_kind,
             });
         }
-        Ok(Some(ChTable { engine, columns }))
+        Ok(Some(ChTable {
+            engine,
+            default_timezone: Some(default_timezone),
+            columns,
+        }))
     }
 }

@@ -22,23 +22,53 @@ jobs:
       - name: Unit tests
         run: cargo +1.99.1 test --locked --lib --bins
 
-  compatibility:
-    name: PostgreSQL ${{ matrix.variant }} and ClickHouse 26.8 LTS
+  linux-binary:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --target x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - name: Build static Linux binary
+        run: |
+          cargo +1.99.1 build --release --locked --target x86_64-unknown-linux-musl
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/sync-pg2ch dist/
+          strip dist/sync-pg2ch
+          cd dist
+          sha256sum sync-pg2ch > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sync-pg2ch-linux-x86_64-musl
+          path: dist/
+          retention-days: 30
+
+  compatibility:
+    name: PostgreSQL ${{ matrix.postgres.variant }} and ClickHouse ${{ matrix.clickhouse.version }} LTS
+    runs-on: ubuntu-24.04
+    needs: linux-binary
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        include:
+        postgres:
           - variant: "14"
-            postgres_image: postgres:14.24-bookworm@sha256:a389ed49344afc8f4444efd4eb512965df07aaa6ed84b239b54a23246e9fe347
+            image: postgres:14.24-bookworm@sha256:a389ed49344afc8f4444efd4eb512965df07aaa6ed84b239b54a23246e9fe347
             postgis: "false"
           - variant: "14 + PostGIS 3.6"
-            postgres_image: postgis/postgis:14-3.6@sha256:fdf13349aac39b694214d1f323eab3b9ae9a624e2efb582a4c8d3debb1d0b817
+            image: postgis/postgis:14-3.6@sha256:fdf13349aac39b694214d1f323eab3b9ae9a624e2efb582a4c8d3debb1d0b817
             postgis: "true"
+        clickhouse:
+          - version: "25.8"
+            image: clickhouse/clickhouse-server:25.8.23.13@sha256:f58a9d341fabdb20a9c2e98bbb595f7566103f762ef62be0d4f283e0832869fa
+          - version: "26.8"
+            image: clickhouse:26.8.36.3-jammy@sha256:1201467edf24c3a40c5670aceaece9b51479fbd65e8aeea22e246d5816a322ea
     services:
       postgres:
-        image: ${{ matrix.postgres_image }}
+        image: ${{ matrix.postgres.image }}
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: test-pass
@@ -51,7 +81,7 @@ jobs:
           --health-timeout 5s
           --health-retries 30
       clickhouse:
-        image: clickhouse:26.8.36.3-jammy@sha256:1201467edf24c3a40c5670aceaece9b51479fbd65e8aeea22e246d5816a322ea
+        image: ${{ matrix.clickhouse.image }}
         env:
           CLICKHOUSE_USER: default
           CLICKHOUSE_PASSWORD: test-pass
@@ -68,10 +98,20 @@ jobs:
     env:
       CH_USER: default
       CH_PASSWORD: test-pass
-      TEST_POSTGIS: ${{ matrix.postgis }}
+      TEST_POSTGIS: ${{ matrix.postgres.postgis }}
       TEST_ARTIFACTS: artifacts
+      SYNC_PG2CH_TEST_BINARY: ${{ github.workspace }}/dist/sync-pg2ch
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: sync-pg2ch-linux-x86_64-musl
+          path: dist/
+      - name: Verify binary checksum
+        run: |
+          cd dist
+          sha256sum --check SHA256SUMS
+          chmod +x sync-pg2ch
       - name: Set service endpoints
         env:
           TEST_PG_URL: postgres://postgres:test-pass@localhost:${{ job.services.postgres.ports['5432'] }}/postgres?sslmode=disable
@@ -90,6 +130,11 @@ jobs:
           docker inspect --format '{{.Config.Image}} {{.Image}}' "$PG_CONTAINER" "$CH_CONTAINER" > artifacts/images.txt
       - name: Run compatibility matrix
         run: cargo +1.99.1 test --locked --features integration --test integration -- --nocapture
+      - name: Verify PostgreSQL Unix socket connection
+        env:
+          PG_CONTAINER: ${{ job.services.postgres.id }}
+          CH_CONTAINER: ${{ job.services.clickhouse.id }}
+        run: bash tests/fixtures/socket-smoke.sh
       - name: Configure TLS services
         env:
           PG_CONTAINER: ${{ job.services.postgres.id }}
@@ -111,6 +156,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: compatibility-postgis-${{ matrix.postgis }}
+          name: compatibility-ch-${{ matrix.clickhouse.version }}-postgis-${{ matrix.postgres.postgis }}
           path: artifacts/
           retention-days: 7

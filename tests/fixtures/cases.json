@@ -172,5 +172,11 @@
   {"name": "postgis_geography", "pg_columns": "v spatial.geography(Point,4326) NOT NULL", "ch_columns": "v String", "status": "match", "postgis": true, "geo": {"family": "geography", "subtype": "Point", "srid": 4326, "dimensions": 2}},
   {"name": "postgis_geography_lc", "pg_columns": "v spatial.geography(Point,4326) NOT NULL", "ch_columns": "v LowCardinality(String)", "status": "compatible", "postgis": true},
   {"name": "postgis_null_rejected", "pg_columns": "v spatial.geometry(Point,4326)", "ch_columns": "v String", "status": "mismatch", "postgis": true},
-  {"name": "postgis_native", "pg_columns": "v spatial.geometry(Point,4326) NOT NULL", "ch_columns": "v Point", "status": "mismatch", "postgis": true, "code": "geo_representation_mismatch"}
+  {"name": "postgis_native", "pg_columns": "v spatial.geometry(Point,4326) NOT NULL", "ch_columns": "v Point", "status": "mismatch", "postgis": true, "code": "geo_representation_mismatch"},
+  {"name": "tsvector", "pg_columns": "v tsvector NOT NULL", "ch_columns": "v String", "status": "match"},
+  {"name": "tsvector_nullable", "pg_columns": "v tsvector", "ch_columns": "v Nullable(String)", "status": "match"},
+  {"name": "tsvector_null_rejected", "pg_columns": "v tsvector", "ch_columns": "v String", "status": "mismatch", "code":"nullability_mismatch"},
+  {"name": "inherited_utc", "pg_columns": "v timestamptz(6) NOT NULL", "ch_columns": "v DateTime64(6)", "status": "compatible", "code":"inherited_timezone"},
+  {"name": "inherited_utc_null_rejected", "pg_columns": "v timestamptz(6)", "ch_columns": "v DateTime64(6)", "status": "mismatch", "code":"nullability_mismatch"},
+  {"name": "inherited_utc_precision", "pg_columns": "v timestamptz(6) NOT NULL", "ch_columns": "v DateTime64(3)", "status": "mismatch", "code":"type_mismatch"}
 ]

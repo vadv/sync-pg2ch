@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::compatibility::{compare_types, expected_definition};
+use crate::compatibility::{compare_types_in_timezone, expected_definition};
 use crate::config::TablePair;
 use crate::model::{ChColumn, ChTable, Finding, PgColumn, PgTable, Status, TableDiff};
 
@@ -19,6 +19,7 @@ pub fn compare(pair: &TablePair, source: Option<&PgTable>, target: Option<&ChTab
             None => Vec::new(),
         },
         target: pair.target.clone(),
+        default_timezone: target.and_then(|table| table.default_timezone.clone()),
         status: Status::Match,
         findings: Vec::new(),
         ignored_target_columns: pair.ignore_target_columns.clone(),
@@ -75,6 +76,7 @@ pub fn compare(pair: &TablePair, source: Option<&PgTable>, target: Option<&ChTab
         finalize(&mut result);
         return result;
     };
+    let default_timezone = target.default_timezone.as_deref();
     let source_columns = source_columns(source, &mut result.findings);
     let target_columns = target_columns(target, &mut result.findings);
     for (name, source) in &source_columns {
@@ -107,7 +109,7 @@ pub fn compare(pair: &TablePair, source: Option<&PgTable>, target: Option<&ChTab
             }
             continue;
         };
-        compare_column(source, target, &mut result.findings);
+        compare_column(source, target, default_timezone, &mut result.findings);
     }
     for (name, target) in &target_columns {
         if source_columns.contains_key(name) {
@@ -169,7 +171,12 @@ fn target_columns<'a>(
     columns
 }
 
-fn compare_column(source: &PgColumn, target: &ChColumn, findings: &mut Vec<Finding>) {
+fn compare_column(
+    source: &PgColumn,
+    target: &ChColumn,
+    default_timezone: Option<&str>,
+    findings: &mut Vec<Finding>,
+) {
     if source.generated {
         findings.push(generated_finding(source, Some(target)));
     }
@@ -192,7 +199,8 @@ fn compare_column(source: &PgColumn, target: &ChColumn, findings: &mut Vec<Findi
             format!("target default kind {kind:?} has no supported v1 write rule"),
         )),
     }
-    let comparison = compare_types(&source.data_type, &target.data_type);
+    let comparison =
+        compare_types_in_timezone(&source.data_type, &target.data_type, default_timezone);
     let expected = match comparison.expected {
         Some(expected) if source.nullable => Some(format!("Nullable({expected})")),
         Some(expected) => Some(expected),
@@ -367,6 +375,7 @@ mod tests {
     fn target(columns: Vec<ChColumn>) -> ChTable {
         ChTable {
             engine: "MergeTree".into(),
+            default_timezone: None,
             columns,
         }
     }

@@ -103,10 +103,10 @@ pub async fn run(config: &Config, mode: Mode) -> PlanReport {
         report.errors.push(error);
     }
     match ch {
-        Ok(version) if version.starts_with("26.8.") => {}
+        Ok(version) if version.starts_with("25.8.") || version.starts_with("26.8.") => {}
         Ok(_) => report.errors.push(CatalogError::new(
             "unsupported_ddl_version",
-            "DDL execution is validated for ClickHouse 26.8 LTS",
+            "DDL execution is validated for ClickHouse 25.8 and 26.8 LTS",
         )),
         Err(error) => report.errors.push(error),
     }
@@ -140,6 +140,16 @@ pub async fn run(config: &Config, mode: Mode) -> PlanReport {
             return report;
         }
     };
+    let (targets, skipped) = crate::discovery::select(targets, &config.discovery);
+    report.skipped_tables = skipped;
+    if targets.is_empty() {
+        report.errors.push(CatalogError::new(
+            "no_tables_selected",
+            "all discovered ClickHouse tables were excluded",
+        ));
+        report.status = PlanStatus::Blocked;
+        return report;
+    }
     let mut snapshots = Vec::with_capacity(targets.len());
     for target in &targets {
         match read(&mut postgres, &clickhouse, target, config).await {
@@ -216,6 +226,7 @@ pub async fn run(config: &Config, mode: Mode) -> PlanReport {
         clickhouse.tables(&config.clickhouse.database),
     )
     .await
+    .map(|tables| crate::discovery::select(tables, &config.discovery).0)
     {
         Ok(second) if second == targets => {}
         Ok(_) => report.errors.push(CatalogError::new(
@@ -419,7 +430,10 @@ fn verified(first: &DdlSnapshot, current: &DdlSnapshot, plan: &TablePlan) -> boo
 }
 
 fn same_schema(expected: &ChTable, actual: &ChTable) -> bool {
-    if expected.engine != actual.engine || expected.columns.len() != actual.columns.len() {
+    if expected.engine != actual.engine
+        || expected.default_timezone != actual.default_timezone
+        || expected.columns.len() != actual.columns.len()
+    {
         return false;
     }
     for (expected, actual) in expected.columns.iter().zip(&actual.columns) {

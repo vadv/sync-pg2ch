@@ -57,6 +57,15 @@ impl PlanReport {
             PlanStatus::Indeterminate => "indeterminate",
         };
         writeln!(writer, "{mode}: {status}")?;
+        for skipped in &self.skipped_tables {
+            writeln!(
+                writer,
+                "skipped {:?}.{:?}: {}",
+                skipped.target.database,
+                skipped.target.table,
+                skipped.rule.escape_debug()
+            )?;
+        }
         let mut operations = 0;
         let mut blockers = 0;
         for table in &self.tables {

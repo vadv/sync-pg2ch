@@ -51,6 +51,8 @@ pub struct Report {
     pub servers: Servers,
     /// Discovered table results in deterministic identifier order.
     pub tables: Vec<TableDiff>,
+    /// Tables excluded explicitly from the comparison scope.
+    pub skipped_tables: Vec<crate::discovery::SkippedTable>,
     /// Operational diagnostics without driver messages or secrets.
     pub errors: Vec<CatalogError>,
 }
@@ -64,7 +66,8 @@ impl Default for Report {
                 "Only schema metadata is checked; row values and CDC serialization are not validated.",
                 "Column order, constraints, indexes, defaults, sorting keys and TTL are not compared.",
                 "Date/time ranges and special values may differ between PostgreSQL and ClickHouse.",
-                "JSON, bytea and geometry use explicit String representation conventions.",
+                "JSON, bytea, tsvector and geometry use explicit String representation conventions.",
+                "Implicit DateTime64 timezone is checked for this connection; CDC sessions must use the same timezone.",
                 "Geo subtype, SRID and dimensions are not_represented_in_target_schema for String; arbitrary CHECK constraints and historical SRID changes are not inferred.",
                 "Two metadata reads detect observed changes, not an atomic snapshot across servers or future DDL.",
             ],
@@ -73,6 +76,7 @@ impl Default for Report {
             counts: Counts::default(),
             servers: Servers::default(),
             tables: Vec::new(),
+            skipped_tables: Vec::new(),
             errors: Vec::new(),
         }
     }
@@ -127,6 +131,15 @@ impl Report {
             self.complete,
             self.policy
         )?;
+        for skipped in &self.skipped_tables {
+            writeln!(
+                writer,
+                "skipped {:?}.{:?}: {}",
+                skipped.target.database,
+                skipped.target.table,
+                skipped.rule.escape_debug()
+            )?;
+        }
         for table in &self.tables {
             write!(writer, "{} ", status_name(table.status))?;
             match &table.source {

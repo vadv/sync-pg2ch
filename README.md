@@ -6,6 +6,10 @@ CLI на Rust для проверки совместимости схем Postgr
 
 ## Запуск
 
+Готовый статический бинарник Linux x86_64 доступен в artifact `sync-pg2ch-linux-x86_64-musl` успешного запуска [CI](https://github.com/vadv/sync-pg2ch/actions/workflows/ci.yml). Он не зависит от установленной glibc. После скачивания и распаковки проверьте `sha256sum --check SHA256SUMS`, выполните `chmod +x sync-pg2ch` и запускайте `./sync-pg2ch`.
+
+Сборка из исходников:
+
 ```sh
 cargo build --release --locked
 cp examples/config.toml config.toml
@@ -45,7 +49,17 @@ ignore_target_columns = ["_peerdb_version", "_peerdb_is_deleted"]
 
 Правило `schema.table → schema_table` соответствует [стандартному имени назначения ClickHouse в PeerDB](https://github.com/PeerDB-io/peerdb/blob/8a3660f976c0845bff163ea123581e5cbdd8a5d7/ui/app/mirrors/create/handlers.ts#L383-L420). Произвольные переименования и замена префикса в настройках mirror не поддерживаются. Поиск работает в заданной PG-схеме без обращения к PeerDB.
 
-Пароли и URL читаются из переменных окружения. Полный пример конфигурации: [examples/config.toml](examples/config.toml).
+Служебные и временные копии таблиц можно исключить явно:
+
+```toml
+[discovery]
+exclude_table_prefixes = ["_peerdb_raw_"]
+exclude_tables = ["public_orders_resync"]
+```
+
+Имена и префиксы сравниваются буквально с учётом регистра; wildcard-правил нет. По умолчанию исключений нет. Все команды показывают пропущенные таблицы и сработавшее правило в `skipped_tables`; для них PG-источник не ищется и DDL не строится. Если исключены все таблицы, возвращается `no_tables_selected`, exit 2.
+
+Пароли и URL читаются из переменных окружения. Полный пример конфигурации: [examples/config.toml](examples/config.toml). Для PostgreSQL через Unix socket допустим `PG_URL='postgres://reader@/app?host=/var/run/postgresql&sslmode=disable'`.
 
 Для PostgreSQL TLS включён по умолчанию с проверкой сертификата и имени сервера. Для собственного CA используйте URL с `sslmode=verify-full&sslrootcert=/path/ca.pem`. Пример выше явно отключает TLS для локального стенда; режимы с непроверенным сертификатом не поддерживаются.
 
@@ -63,7 +77,7 @@ target/release/sync-pg2ch apply --config config.toml --format json
 
 Поддержаны `ADD COLUMN` и ограниченный набор `MODIFY COLUMN`: расширение signed integer до Int64, Float32 → Float64, Date → Date32, увеличение ёмкости Decimal и добавление Nullable. Более широкий существующий тип сохраняется. Новая колонка получает `Nullable(T)`, даже если PG требует NOT NULL; в старых строках будет NULL. Лишние CH-колонки сохраняются.
 
-DDL выполняется на указанном сервере ClickHouse 26.8 LTS для MergeTree/ReplacingMergeTree в базе Atomic/Ordinary. Изменение ключей и аргументов движка, зависимости, TTL, constraints и неподдержанная топология блокируют план. Полные [правила DDL](docs/ddl-plan.md) описывают ограничения DEFAULT, codecs, индексов и projections.
+DDL выполняется на указанном сервере ClickHouse 25.8 или 26.8 LTS для MergeTree/ReplacingMergeTree в базе Atomic/Ordinary. Изменение ключей и аргументов движка, зависимости, TTL, constraints и неподдержанная топология блокируют план. Независимый `DEFAULT now64()` служебной колонки допускается. Полные [правила DDL](docs/ddl-plan.md) описывают ограничения DEFAULT, codecs, индексов и projections.
 
 На каждую таблицу отправляется один составной ALTER. После него приложение проверяет результат; при ошибке прекращает отправку следующих команд. Отчёт сохраняет `query_id` и состояния `completed`, `failed`, `not_sent`, `indeterminate`. Последнее означает, что исход нужно проверить на сервере перед повторным запуском. Общего rollback для нескольких таблиц нет.
 
@@ -92,7 +106,9 @@ compatible "public"."events" -> "analytics"."events"
 
 При смешанном результате код 2 имеет приоритет над 1. Успешно прочитанные пары сохраняются в отчёте даже при ошибке другой пары. Приложение само не останавливает CDC: вызывающий процесс должен обработать ненулевой exit code.
 
-JSON содержит `report_version = 1`, `policy`, `policy_limitations`, `complete`, `status`, `counts`, `servers`, `tables` и `errors`. Каждый элемент `findings` содержит код результата, имя колонки, исходное определение PG-типа, ожидаемое и фактическое CH-представление. Одна колонка может иметь несколько результатов, например по типу и nullable. JSON включает совпадения и геометаданные; text показывает различия и итог по таблицам. Диагностика идёт в stderr, отчёт — в stdout; сообщения драйверов с потенциальными секретами не выводятся.
+JSON содержит `report_version = 1`, `policy`, `policy_limitations`, `complete`, `status`, `counts`, `servers`, `tables`, `skipped_tables` и `errors`. Каждый элемент `findings` содержит код результата, имя колонки, исходное определение PG-типа, ожидаемое и фактическое CH-представление. Одна колонка может иметь несколько результатов, например по типу и nullable. JSON включает совпадения и геометаданные; text показывает различия и итог по таблицам. Диагностика идёт в stderr, отчёт — в stdout.
+
+Ошибки подключения указывают этап и причину: неверные credentials, отсутствие прав, отказ соединения или ошибка TLS. Где сервер возвращает код, сохраняется SQLSTATE PostgreSQL или номер ошибки ClickHouse. Полный текст ошибок драйверов и URL с паролями не выводится.
 
 Поле `source` содержит найденный источник или `null`, если источник отсутствует, неоднозначен либо не прочитан. `source_candidates` перечисляет найденных PG-кандидатов. Таблицы в отчёте сортируются по CH-базе и имени, результаты внутри таблицы — по имени колонки и коду.
 
@@ -105,6 +121,8 @@ JSON содержит `report_version = 1`, `policy`, `policy_limitations`, `com
 - Безопасное расширение назначения разрешено; сужение и signed → unsigned дают mismatch.
 - Decimal проверяется по исходным precision/scale PG, включая ёмкость целой части.
 - Nullable проверяется независимо от базового типа. DEFAULT не заменяет возможность хранить NULL.
+- `timestamptz` → `DateTime64(p)` без явной зоны допускается при подходящей точности, если `timezone()` подключения CH возвращает UTC или Etc/UTC. В отчёте — `inherited_timezone` и `default_timezone`. Другая зона даёт mismatch; CDC-подключение должно использовать ту же зону.
+- `tsvector` сопоставляется со String или LowCardinality(String); Nullable проверяется отдельно. Содержимое строк не проверяется.
 - Все семь встроенных геотипов PG и PostGIS `geometry`/`geography` сопоставляются со String. PostGIS определяется по принадлежности типа расширению. В JSON сохраняются объявленные subtype, SRID и Z/M; CH String эти ограничения не выражает.
 - Лишняя CH-колонка даёт `compatible` с кодом `target_only_column`. Исключения в `comparison.ignore_target_columns` скрывают выбранные колонки из diff и применяются ко всем найденным таблицам. Исключение не может скрыть колонку PG.
 - Порядок колонок игнорируется. Переименование отображается как отсутствующая и лишняя колонки. ALIAS/MATERIALIZED вместо исходной колонки дают mismatch.
@@ -134,7 +152,16 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --lib --bins
 ```
 
-[GitHub Actions](.github/workflows/ci.yml) запускает Docker service containers: PostgreSQL 14.24 и PostgreSQL 14.24 + PostGIS 3.6.4, каждый с ClickHouse 26.8.36.3 LTS. Образы закреплены digest в workflow; Rust для CI — 1.99.1.
+[GitHub Actions](.github/workflows/ci.yml) запускает Docker service containers: PostgreSQL 14.24 и PostgreSQL 14.24 + PostGIS 3.6.4, каждый с ClickHouse 25.8.23.13 и 26.8.36.3 LTS. Образы закреплены digest в workflow; Rust для CI — 1.99.1. Во всех четырёх сочетаниях проверяется один статический бинарник из artifact, включая TLS и подключение PG через Unix socket.
+
+Локальная статическая сборка требует `musl-gcc` (пакет `musl-tools` в Debian/Ubuntu):
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --locked --target x86_64-unknown-linux-musl
+```
+
+Для проверки готового бинарника задайте `SYNC_PG2CH_TEST_BINARY=/absolute/path/sync-pg2ch`; без этой переменной тесты используют бинарник, собранный Cargo.
 
 Локальный запуск той же матрицы требует самостоятельно поднятых тестовых серверов и административных подключений:
 

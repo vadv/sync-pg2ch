@@ -10,6 +10,12 @@ database = "analytics"
 user_env = "CH_USER"
 password_env = "CH_PASSWORD"
 
+[discovery]
+# Literal, case-sensitive ClickHouse names and prefixes. No wildcards.
+exclude_tables = []
+exclude_table_prefixes = []
+# PeerDB example: exclude_table_prefixes = ["_peerdb_raw_"]
+
 [comparison]
 policy = "pg-clickhouse-v1"
 connect_timeout_seconds = 5

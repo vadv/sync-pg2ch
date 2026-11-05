@@ -65,7 +65,7 @@ JSON содержит `report_version`, идентификатор полити�
 
 Команды: `sync-pg2ch diff|plan|apply --config config.toml --format text|json`. Для `plan` также доступен `--format sql`. Формат по умолчанию: `text`.
 
-TOML содержит ссылки на переменные окружения для подключений, имя CH-базы, PG-схему, таймауты и исключения колонок. Значения секретов читаются из окружения. Пример формата:
+TOML содержит ссылки на переменные окружения для подключений, имя CH-базы, PG-схему, таймауты и исключения таблиц и колонок. Значения секретов читаются из окружения. Пример формата:
 
 ```toml
 config_version = 1
@@ -79,6 +79,10 @@ url_env = "CH_URL"
 database = "analytics"
 user_env = "CH_USER"
 password_env = "CH_PASSWORD"
+
+[discovery]
+exclude_table_prefixes = ["_peerdb_raw_"]
+exclude_tables = ["public_orders_resync"]
 
 [comparison]
 policy = "pg-clickhouse-v1"
@@ -129,19 +133,22 @@ CH-адаптер читает `system.tables` и `system.columns`: имена, 
 
 ## Docker и матрицы тестирования
 
-Начальная обязательная пара версий: **PostgreSQL 14 × ClickHouse 26.8 LTS**, с двумя конфигурациями PG: без расширений и с PostGIS. Поддержка других веток не заявляется без прогонов. Образы скачаны и проверены локально 2026-11-05. Фактические версии: PostgreSQL 14.24, PostGIS 3.6.4 и ClickHouse 26.8.36.3. Digest закреплены в workflow GitHub Actions.
+Обязательная матрица: **PostgreSQL 14 × ClickHouse 25.8 и 26.8 LTS**, с двумя конфигурациями PG: без расширений и с PostGIS. Фактические версии: PostgreSQL 14.24, PostGIS 3.6.4, ClickHouse 25.8.23.13 и 26.8.36.3. Digest закреплены в workflow GitHub Actions.
 
 | Сервер | Проверенный тег (digest в workflow) |
 |---|---|
 | PostgreSQL | `postgres:14.24-bookworm` |
 | PostgreSQL 14 + PostGIS | `postgis/postgis:14-3.6`, с закреплением digest; ожидаемая версия PostGIS 3.6.4 |
-| ClickHouse | `clickhouse:26.8.36.3-jammy` |
+| ClickHouse 25.8 | `clickhouse/clickhouse-server:25.8.23.13` |
+| ClickHouse 26.8 | `clickhouse:26.8.36.3-jammy` |
 
-Для amd64 проверены образы, закреплены digest и фактические версии серверов. Образы задаются в `strategy.matrix.include` workflow GitHub Actions и подставляются в `services`. Это единственный источник версий тестового окружения. Теги `latest`, `lts` и голый `14` не используются в обязательных тестах. Обновление patch-версии требует полного прогона той же матрицы.
+Для amd64 проверены образы, закреплены digest и фактические версии серверов. Образы задаются в `strategy.matrix` workflow GitHub Actions и подставляются в `services`. Это единственный источник версий тестового окружения. Теги `latest`, `lts` и голый `14` не используются в обязательных тестах. Обновление patch-версии требует полного прогона той же матрицы.
 
 GitHub Actions запускает PostgreSQL и ClickHouse как service containers на Ubuntu runner и удаляет их после job. Health checks проверяют готовность серверов до тестов. Rust-тесты запускаются на runner, получают endpoints через env и используют опубликованные порты сервисов. Каждая matrix job получает отдельную пару серверов; сценариям внутри job выделяются отдельные schema/database или уникальные имена.
 
-Матрица содержит записи `pg14` и `pg14-postgis`, обе с одним закреплённым CH LTS. Базовые и встроенные geo-кейсы выполняются в обеих; PostGIS-кейсы обязательны в `pg14-postgis`. Setup создаёт расширение в fixture database и проверяет его версию, не полагаясь на наличие расширения в template database. Отсутствие ожидаемого PostGIS завершает job ошибкой. В plain PG job проверяется работа приложения без PostGIS. Для образа PostGIS используется поддержанный amd64 runner.
+Матрица содержит четыре сочетания PG и CH. Базовые и встроенные geo-кейсы выполняются во всех; PostGIS-кейсы — в обеих конфигурациях с расширением. Setup создаёт расширение в fixture database и проверяет его версию, не полагаясь на наличие расширения в template database. Отсутствие ожидаемого PostGIS завершает job ошибкой. В plain PG job проверяется работа приложения без PostGIS. Для образа PostGIS используется поддержанный amd64 runner.
+
+Отдельная job собирает статический Linux x86_64 бинарник с musl и сохраняет его с SHA256 в artifact. Все четыре integration job используют именно этот бинарник, включая TLS и Unix socket PostgreSQL. Сборка не требует glibc на машине пользователя.
 
 Testcontainers и отдельный Compose-harness не используются. При ручном воспроизведении те же тесты можно направить на самостоятельно запущенные базы через env. Для TLS-кейсов шаг CI генерирует тестовый CA и сертификаты, устанавливает конфигурацию сервисов и проверяет их готовность после перезапуска; Rust-тесты проверяют клиентские подключения.
 
@@ -177,7 +184,7 @@ Fixture описывает PG DDL, CH DDL, ожидаемые findings и exit c
 | 4. CLI end-to-end | Отчёт text/JSON, итоговый статус, частичные ошибки, повторная проверка метаданных | Запуск бинарника даёт ожидаемые findings и exit code на каждой группе fixtures |
 | 5. Выпуск | CI, пример config, README, ограничения и поддержанные версии | Форматирование, Clippy, unit и Docker suite проходят; сценарий запуска воспроизводим |
 
-Обязательные проверки реализации: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, unit-тесты и отдельный Docker integration target. Команды тестовых targets зафиксированы в README и workflow. Матрицы diff содержат 158/174 случая без PostGIS и с ним. DDL-тесты проверяют старые значения, новые NULL, блокировки всего запуска, повторный apply, гонку метаданных и сбои выполнения через записывающий HTTP-прокси. Реплицируемые движки проверяются как запрещённая топология unit-тестами; кластерный DDL не поддержан.
+Обязательные проверки реализации: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, unit-тесты и отдельный Docker integration target. Команды тестовых targets зафиксированы в README и workflow. Матрицы diff содержат 164/180 случаев без PostGIS и с ним, включая tsvector и неявную UTC. DDL-тесты проверяют старые значения, новые NULL, исключения таблиц, независимый DEFAULT, блокировки всего запуска, повторный apply, гонку метаданных и сбои выполнения через записывающий HTTP-прокси. Реплицируемые движки проверяются как запрещённая топология unit-тестами; кластерный DDL не поддержан.
 
 ## Что учтено из исследования
 

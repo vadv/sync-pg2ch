@@ -29,11 +29,14 @@ Nullable сравнивается отдельно от базового тип�
 | timestamp(p) without time zone | DateTime64(p), без явно заданной timezone | Увеличение p в пределах проверенного диапазона |
 | timestamp(p) with time zone | DateTime64(p, 'UTC') | Увеличение p при той же timezone и проверенном диапазоне |
 | json, jsonb | String | LowCardinality(String); только соглашение о текстовом JSON |
+| tsvector | String | LowCardinality(String); текстовое представление tsvector |
 | bytea | String | Только соглашение о передаче байтов |
 | point, line, lseg, box, path, polygon, circle | String | LowCardinality(String); текстовое представление геометрии |
 | PostGIS geometry, geography, включая typmod | String | LowCardinality(String); текстовое представление геометрии |
 
-У timestamp без явного precision используется precision 6. Timezone сохраняется как отдельное свойство; отсутствие timezone не считается автоматически эквивалентным явно указанной UTC. Для timestamp without time zone схема не доказывает правильную интерпретацию локального времени. Если реальные таблицы требуют иных соглашений, меняется явная политика, а не вводится неявное приведение типов.
+У timestamp без явного precision используется precision 6. Для `timestamptz` назначение `DateTime64(p)` без явной зоны совместимо, если фактическая `timezone()` подключения CH — `UTC` или `Etc/UTC`, а точность подходит. Результат имеет код `inherited_timezone`; прочитанная зона сохраняется в `default_timezone`. Другая зона даёт `timezone_mismatch`, неизвестная — `implicit_timezone_unknown`. Явная не-UTC зона остаётся несовместимой.
+
+Настройка [session_timezone](https://clickhouse.com/docs/reference/settings/session-settings/other#session_timezone) может переопределить серверную зону, поэтому проверяется зона текущего подключения. Совместимость предполагает ту же настройку у CDC. Для timestamp without time zone схема не доказывает правильную интерпретацию локального времени.
 
 У varchar(n) ограничение длины не переносится в CH; String является выбранным представлением. Char(n), time, interval, unconstrained numeric, numeric вне поддержанного p/s, массивы, domains, enum, composite/range и типы расширений без отдельного правила дают `unknown` в v1. PostGIS geometry/geography имеют отдельные правила и не попадают в общий отказ для расширений. Типы CH вне поддержанного парсера и матрицы также дают `unknown`, без fallback в String.
 

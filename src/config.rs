@@ -82,6 +82,16 @@ pub struct ComparisonConfig {
     pub ignore_target_columns: Vec<String>,
 }
 
+/// Explicit exclusions from automatic ClickHouse discovery.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DiscoveryConfig {
+    /// Exact table names to skip; no wildcard interpretation.
+    pub exclude_tables: Vec<String>,
+    /// Literal case-sensitive prefixes of table names to skip.
+    pub exclude_table_prefixes: Vec<String>,
+}
+
 /// Deadline for a DDL request, including server-side mutation completion.
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -122,6 +132,9 @@ pub struct Config {
     /// Comparison settings.
     #[serde(default)]
     pub comparison: ComparisonConfig,
+    /// Table exclusions applied equally to diff, plan and apply.
+    #[serde(default)]
+    pub discovery: DiscoveryConfig,
     /// DDL execution settings.
     #[serde(default)]
     pub apply: ApplyConfig,
@@ -191,6 +204,19 @@ impl Config {
             return Err(ConfigError(
                 "select a user ClickHouse database for discovery".into(),
             ));
+        }
+        for rules in [
+            &mut self.discovery.exclude_tables,
+            &mut self.discovery.exclude_table_prefixes,
+        ] {
+            let mut seen = BTreeSet::new();
+            for rule in rules.iter() {
+                validate_identifier(rule)?;
+                if !seen.insert(rule) {
+                    return Err(ConfigError("duplicate table exclusion".into()));
+                }
+            }
+            rules.sort();
         }
         let mut ignored = BTreeSet::new();
         for column in &self.comparison.ignore_target_columns {
@@ -284,6 +310,9 @@ database = "analytics.with.dot"
             ),
             format!("{CONFIG}\n[comparison]\nquery_timeout_seconds = 0"),
             format!("{CONFIG}\n[comparison]\nignore_target_columns = ['v', 'v']"),
+            format!("{CONFIG}\n[discovery]\nexclude_tables = ['a', 'a']"),
+            format!("{CONFIG}\n[discovery]\nexclude_table_prefixes = ['']"),
+            format!("{CONFIG}\n[discovery]\nexclude_table_prefixes = ['raw_', 'raw_']"),
         ] {
             assert!(Config::parse(&text).is_err());
         }

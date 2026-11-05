@@ -109,17 +109,75 @@ fn tokens(input: &str) -> Option<Vec<Token>> {
     Some(result)
 }
 
-pub(super) fn constant_expression(expression: &str) -> bool {
-    let Some(tokens) = tokens(expression) else {
-        return false;
-    };
-    for token in &tokens {
+/// Resolve simple scalar expressions; unknown syntax or functions remain a blocker.
+pub(super) fn expression_references(expression: &str, columns: &[&str]) -> Option<Vec<String>> {
+    let tokens = tokens(expression)?;
+    let mut references = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
         match token {
-            Token::Literal | Token::Symbol('+' | '-' | '.') => {}
-            _ => return false,
+            Token::Word(name) if tokens.get(index + 1) == Some(&Token::Symbol('(')) => {
+                if ![
+                    "now",
+                    "now64",
+                    "today",
+                    "yesterday",
+                    "generateUUIDv4",
+                    "plus",
+                    "minus",
+                    "multiply",
+                    "divide",
+                    "intDiv",
+                    "modulo",
+                    "negate",
+                    "abs",
+                    "round",
+                    "coalesce",
+                    "ifNull",
+                    "assumeNotNull",
+                    "if",
+                    "multiIf",
+                    "concat",
+                    "lower",
+                    "upper",
+                    "length",
+                    "toString",
+                    "toInt8",
+                    "toInt16",
+                    "toInt32",
+                    "toInt64",
+                    "toUInt8",
+                    "toUInt16",
+                    "toUInt32",
+                    "toUInt64",
+                    "toFloat32",
+                    "toFloat64",
+                    "toDate",
+                    "toDate32",
+                    "toDateTime",
+                    "toDateTime64",
+                ]
+                .contains(&name.as_str())
+                {
+                    return None;
+                }
+            }
+            Token::Word(name) if ["NULL", "true", "false"].contains(&name.as_str()) => {}
+            Token::Word(name) | Token::Identifier(name) => {
+                if !columns.contains(&name.as_str()) {
+                    return None;
+                }
+                if !references.contains(name) {
+                    references.push(name.clone());
+                }
+            }
+            Token::Literal
+            | Token::Symbol(
+                '(' | ')' | ',' | '+' | '-' | '*' | '/' | '%' | '=' | '<' | '>' | '!',
+            ) => {}
+            Token::Symbol(_) => return None,
         }
     }
-    !tokens.is_empty()
+    Some(references)
 }
 
 pub(super) fn generic_codec(codec: &str) -> bool {
@@ -185,6 +243,30 @@ pub(super) fn engine_columns(definition: &str) -> Option<Vec<String>> {
 mod tests {
     use super::*;
     #[test]
+    fn expression_references_resolve_columns_without_treating_literals_as_names() {
+        let columns = ["v", "id", "v.Ю"];
+        assert_eq!(expression_references("now64()", &columns), Some(vec![]));
+        assert_eq!(
+            expression_references("plus(id, 1)", &columns),
+            Some(vec!["id".into()])
+        );
+        assert_eq!(
+            expression_references("concat('v', toString(`v.Ю`))", &columns),
+            Some(vec!["v.Ю".into()])
+        );
+        assert_eq!(
+            expression_references("plus(v, 1)", &columns),
+            Some(vec!["v".into()])
+        );
+        assert_eq!(expression_references("custom_udf()", &columns), None);
+        assert_eq!(
+            expression_references("dictGet('dict', 'attr', id)", &columns),
+            None
+        );
+        assert_eq!(expression_references("tuple(*)", &columns), None);
+    }
+
+    #[test]
     fn identifiers_and_definition_literals_cannot_become_sql() {
         assert_eq!(quote_identifier("a\"\\\nЮ"), "\"a\\\"\\\\\\nЮ\"");
         assert!(!complex_definition(
@@ -201,7 +283,7 @@ mod tests {
             engine_columns("ReplacingMergeTree(toUInt64(x)) ORDER BY x"),
             None
         );
-        assert!(constant_expression("'a\\'b'"));
-        assert!(!constant_expression("other_column + 1"));
+        assert_eq!(expression_references("'a\\'b'", &[]), Some(Vec::new()));
+        assert_eq!(expression_references("other_column + 1", &[]), None);
     }
 }

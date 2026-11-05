@@ -80,6 +80,8 @@ pub struct PgTable {
 pub struct ChTable {
     /// ClickHouse table engine name.
     pub engine: String,
+    /// Implicit timezone observed on the ClickHouse connection.
+    pub default_timezone: Option<String>,
     /// User column definitions.
     pub columns: Vec<ChColumn>,
 }
@@ -138,6 +140,8 @@ pub struct TableDiff {
     pub source_candidates: Vec<crate::config::SourceTable>,
     /// Discovered ClickHouse target identity.
     pub target: crate::config::TargetTable,
+    /// Implicit timezone used to evaluate timezone-free CH timestamp types.
+    pub default_timezone: Option<String>,
     /// Highest severity among findings for this pair.
     pub status: Status,
     /// Findings sorted by column identifier and reason code.

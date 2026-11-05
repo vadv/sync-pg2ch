@@ -86,8 +86,9 @@ pub(crate) fn alter_destination(
     source: &PgType,
     source_nullable: bool,
     current: &str,
+    default_timezone: Option<&str>,
 ) -> Result<String, String> {
-    let comparison = compare_types(source, current);
+    let comparison = compare_types_in_timezone(source, current, default_timezone);
     if comparison.status == Status::Unknown {
         return Err(comparison.message);
     }
@@ -126,7 +127,7 @@ pub(crate) fn alter_destination(
     if target.low_cardinality {
         definition = format!("LowCardinality({definition})");
     }
-    let comparison = compare_types(source, &definition);
+    let comparison = compare_types_in_timezone(source, &definition, default_timezone);
     if comparison.status > Status::Compatible {
         return Err(comparison.message);
     }
@@ -134,7 +135,17 @@ pub(crate) fn alter_destination(
 }
 
 /// Compares a catalog-resolved PostgreSQL type with a ClickHouse type expression.
+#[cfg(test)]
 pub(crate) fn compare_types(source: &PgType, target: &str) -> TypeComparison {
+    compare_types_in_timezone(source, target, None)
+}
+
+/// Evaluate implicit CH timestamps using the timezone observed in the catalog snapshot.
+pub(crate) fn compare_types_in_timezone(
+    source: &PgType,
+    target: &str,
+    default_timezone: Option<&str>,
+) -> TypeComparison {
     let expected = expected_type(source);
     let target = parse_target(target);
     let expected = match expected {
@@ -163,7 +174,7 @@ pub(crate) fn compare_types(source: &PgType, target: &str) -> TypeComparison {
             };
         }
     };
-    let (status, code, message) = compare_scalar(&expected, &target.scalar);
+    let (status, code, message) = compare_scalar(&expected, &target.scalar, default_timezone);
     let (status, code, message) = if target.low_cardinality {
         if expected.allow_low_cardinality && target.scalar == Scalar::String {
             (
@@ -220,7 +231,9 @@ fn expected_type(source: &PgType) -> Result<Expected, String> {
         "float4" => Scalar::Float(32),
         "float8" => Scalar::Float(64),
         "bool" => Scalar::Bool,
-        "text" | "varchar" | "json" | "jsonb" => return Ok(string_expected(true, false)),
+        "text" | "varchar" | "json" | "jsonb" | "tsvector" => {
+            return Ok(string_expected(true, false));
+        }
         "bytea" => return Ok(string_expected(false, false)),
         "point" | "line" | "lseg" | "box" | "path" | "polygon" | "circle" => {
             return Ok(string_expected(true, true));
@@ -342,7 +355,11 @@ fn scalar_definition(scalar: &Scalar) -> String {
     }
 }
 
-fn compare_scalar(expected: &Expected, target: &Scalar) -> (Status, &'static str, String) {
+fn compare_scalar(
+    expected: &Expected,
+    target: &Scalar,
+    default_timezone: Option<&str>,
+) -> (Status, &'static str, String) {
     if let Scalar::DateTime64 {
         precision,
         timezone: _,
@@ -430,8 +447,24 @@ fn compare_scalar(expected: &Expected, target: &Scalar) -> (Status, &'static str
                 precision,
                 timezone,
             } => {
+                if timezone.is_none() && source_timezone.as_deref() == Some("UTC") {
+                    match default_timezone {
+                        Some("UTC" | "Etc/UTC") if precision >= source_precision => return (
+                            Status::Compatible,
+                            "inherited_timezone",
+                            "the target inherits UTC from this ClickHouse connection; other sessions may override the implicit timezone".into(),
+                        ),
+                        Some("UTC" | "Etc/UTC") => return (Status::Mismatch, "type_mismatch", "target timestamp precision is narrower than the source".into()),
+                        Some(zone) => return (Status::Mismatch, "timezone_mismatch", format!("target inherits timezone {zone:?}; source mapping requires UTC")),
+                        None => return (Status::Unknown, "implicit_timezone_unknown", "the target has no explicit timezone and the ClickHouse default timezone is unavailable".into()),
+                    }
+                }
                 if timezone != source_timezone {
-                    return (Status::Mismatch, "timezone_mismatch", "explicit timezone must match the source mapping, including the distinction between absent timezone and UTC".into());
+                    return (
+                        Status::Mismatch,
+                        "timezone_mismatch",
+                        "explicit timezone does not match the source mapping".into(),
+                    );
                 }
                 precision > source_precision
             }
@@ -811,6 +844,37 @@ mod tests {
     }
 
     #[test]
+    fn implicit_utc_does_not_hide_precision_or_nullability_requirements() {
+        use super::compare_types_in_timezone;
+        let source = pg("timestamptz", 6);
+        assert_eq!(
+            compare_types_in_timezone(&source, "DateTime64(6)", Some("UTC")).status,
+            Status::Compatible
+        );
+        assert_eq!(
+            compare_types_in_timezone(&source, "DateTime64(6)", Some("Europe/Berlin")).status,
+            Status::Mismatch
+        );
+        assert_eq!(
+            compare_types_in_timezone(&source, "DateTime64(3)", Some("UTC")).status,
+            Status::Mismatch
+        );
+        assert_eq!(
+            compare_types_in_timezone(&source, "DateTime64(9)", Some("UTC")).status,
+            Status::Unknown
+        );
+        assert_eq!(
+            compare_types_in_timezone(&source, "DateTime64(6, 'Europe/Berlin')", Some("UTC"))
+                .status,
+            Status::Mismatch
+        );
+        assert_eq!(
+            alter_destination(&source, true, "DateTime64(6)", Some("UTC")).unwrap(),
+            "Nullable(DateTime64(6))"
+        );
+    }
+
+    #[test]
     fn integer_and_float_rules_are_directional() {
         for (source, target, status) in [
             ("int2", "Int16", Status::Match),
@@ -851,7 +915,7 @@ mod tests {
             ("date", false, "Nullable(Date)", "Nullable(Date32)"),
         ] {
             assert_eq!(
-                alter_destination(&pg(source, -1), nullable, current).unwrap(),
+                alter_destination(&pg(source, -1), nullable, current, None).unwrap(),
                 expected
             );
         }
@@ -861,19 +925,32 @@ mod tests {
             ("uuid", "String"),
             ("timestamp", "DateTime64(0)"),
         ] {
-            assert!(alter_destination(&pg(source, -1), false, current).is_err());
+            assert!(alter_destination(&pg(source, -1), false, current, None).is_err());
         }
         let modifier = |precision, scale| ((precision << 16) | scale) + 4;
         assert_eq!(
-            alter_destination(&pg("numeric", modifier(12, 4)), false, "Decimal(9,2)").unwrap(),
+            alter_destination(&pg("numeric", modifier(12, 4)), false, "Decimal(9,2)", None)
+                .unwrap(),
             "Decimal(18,4)"
         );
         assert_eq!(
-            alter_destination(&pg("numeric", modifier(18, 4)), false, "Decimal(18,2)").unwrap(),
+            alter_destination(
+                &pg("numeric", modifier(18, 4)),
+                false,
+                "Decimal(18,2)",
+                None
+            )
+            .unwrap(),
             "Decimal(38,4)"
         );
         assert!(
-            alter_destination(&pg("numeric", modifier(76, 10)), false, "Decimal(76,0)").is_err()
+            alter_destination(
+                &pg("numeric", modifier(76, 10)),
+                false,
+                "Decimal(76,0)",
+                None
+            )
+            .is_err()
         );
     }
 
@@ -953,8 +1030,8 @@ mod tests {
                 "timestamptz",
                 6,
                 "DateTime64(6)",
-                Status::Mismatch,
-                "timezone_mismatch",
+                Status::Unknown,
+                "implicit_timezone_unknown",
             ),
             (
                 "timestamp",

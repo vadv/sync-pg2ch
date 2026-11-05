@@ -154,8 +154,8 @@ impl Environment {
         );
         let ch_version: String = ch.query("SELECT version()").fetch_one().await?;
         assert!(
-            ch_version.starts_with("26.8."),
-            "expected ClickHouse 26.8 LTS, got {ch_version}"
+            ch_version.starts_with("25.8.") || ch_version.starts_with("26.8."),
+            "expected ClickHouse 25.8 or 26.8 LTS, got {ch_version}"
         );
         eprintln!(
             "integration servers: PostgreSQL {version}, ClickHouse {ch_version}, PostGIS={postgis}"
@@ -271,7 +271,9 @@ impl Environment {
         format: &str,
         overrides: &[(&str, &str)],
     ) -> TestResult<Output> {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_sync-pg2ch"));
+        let binary = std::env::var_os("SYNC_PG2CH_TEST_BINARY")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_sync-pg2ch").into());
+        let mut command = Command::new(binary);
         command
             .args([command_name, "--config"])
             .arg(config)
@@ -593,12 +595,18 @@ async fn catalog_failures(environment: &Environment) -> TestResult {
         MockReply::grant("CHECK GRANT SHOW COLUMNS"),
         MockReply::row("SELECT name FROM system.databases", &["catalog-race"]),
         MockReply::row("SELECT name FROM system.tables", &["bigint"]),
-        MockReply::row("SELECT engine FROM system.tables", &["MergeTree"]),
+        MockReply::row(
+            "SELECT engine, timezone() AS default_timezone FROM system.tables",
+            &["MergeTree", "UTC"],
+        ),
         MockReply::row(
             "SELECT name, type, default_kind FROM system.columns",
             &["v", "Int32", ""],
         ),
-        MockReply::row("SELECT engine FROM system.tables", &["MergeTree"]),
+        MockReply::row(
+            "SELECT engine, timezone() AS default_timezone FROM system.tables",
+            &["MergeTree", "UTC"],
+        ),
         MockReply::row(
             "SELECT name, type, default_kind FROM system.columns",
             &["v", "Int64", ""],
@@ -633,12 +641,18 @@ async fn catalog_failures(environment: &Environment) -> TestResult {
             MockReply::grant("CHECK GRANT SHOW COLUMNS"),
             MockReply::row("SELECT name FROM system.databases", &["catalog-race"]),
             MockReply::row("SELECT name FROM system.tables", &["bigint"]),
-            MockReply::row("SELECT engine FROM system.tables", &["MergeTree"]),
+            MockReply::row(
+                "SELECT engine, timezone() AS default_timezone FROM system.tables",
+                &["MergeTree", "UTC"],
+            ),
             MockReply::row(
                 "SELECT name, type, default_kind FROM system.columns",
                 &["v", "Int64", ""],
             ),
-            MockReply::row("SELECT engine FROM system.tables", &["MergeTree"]),
+            MockReply::row(
+                "SELECT engine, timezone() AS default_timezone FROM system.tables",
+                &["MergeTree", "UTC"],
+            ),
             MockReply::row(
                 "SELECT name, type, default_kind FROM system.columns",
                 &["v", "Int64", ""],
@@ -688,9 +702,29 @@ async fn cli_errors(environment: &Environment) -> TestResult {
     assert_eq!(output.status.code(), Some(0));
     assert!(!output.stdout.is_empty());
     let output = environment.run(&config, "json", &[("CH_PASSWORD", "wrong-password-marker")])?;
-    environment.report("bad-credentials", &output, "unknown")?;
+    let report = environment.report("bad-credentials", &output, "unknown")?;
+    assert_eq!(
+        report["errors"][0]["code"],
+        "clickhouse_authentication_error"
+    );
     assert!(!String::from_utf8_lossy(&output.stdout).contains("wrong-password-marker"));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("wrong-password-marker"));
+    let mut bad_pg = Url::parse(&environment.pg_url)?;
+    bad_pg.set_password(Some("wrong-password-marker")).unwrap();
+    let output = environment.run(&config, "json", &[("PG_URL", bad_pg.as_str())])?;
+    let report = environment.report("bad-postgres-credentials", &output, "unknown")?;
+    assert_eq!(report["errors"][0]["code"], "postgres_authentication_error");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("wrong-password-marker"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("wrong-password-marker"));
+    let output = environment.run(&config, "json", &[("CH_URL", "http://127.0.0.1:1")])?;
+    let report = environment.report("connection-refused", &output, "unknown")?;
+    assert_eq!(report["errors"][0]["code"], "clickhouse_connection_error");
+    assert!(
+        report["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("refused")
+    );
     let empty = environment.config("empty", &[], None).await?;
     let report = environment.report("empty", &environment.run(&empty, "json", &[])?, "unknown")?;
     assert_eq!(report["errors"][0]["code"], "no_tables_discovered");
@@ -1001,26 +1035,31 @@ async fn peerdb_mapping_races(environment: &Environment) -> TestResult {
         ),
     ] {
         let url = environment.pg_url.clone();
-        let barrier = MockReply::row("SELECT engine FROM system.tables", &["MergeTree"]).with_hook(
-            move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?;
-                runtime.block_on(async {
-                    let pool = sqlx::PgPool::connect(&url).await?;
-                    sqlx::query(sqlx::AssertSqlSafe(ddl)).execute(&pool).await?;
-                    pool.close().await;
-                    Ok(())
-                })
-            },
-        );
+        let barrier = MockReply::row(
+            "SELECT engine, timezone() AS default_timezone FROM system.tables",
+            &["MergeTree", "UTC"],
+        )
+        .with_hook(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async {
+                let pool = sqlx::PgPool::connect(&url).await?;
+                sqlx::query(sqlx::AssertSqlSafe(ddl)).execute(&pool).await?;
+                pool.close().await;
+                Ok(())
+            })
+        });
         let (endpoint, server) = mock_catalog(vec![
             MockReply::row("SELECT version()", &["26.8.36.3"]),
             MockReply::grant("CHECK GRANT SHOW TABLES"),
             MockReply::grant("CHECK GRANT SHOW COLUMNS"),
             MockReply::row("SELECT name FROM system.databases", &["peerdb-races"]),
             MockReply::row("SELECT name FROM system.tables", &[&target, "zz_barrier"]),
-            MockReply::row("SELECT engine FROM system.tables", &["MergeTree"]),
+            MockReply::row(
+                "SELECT engine, timezone() AS default_timezone FROM system.tables",
+                &["MergeTree", "UTC"],
+            ),
             MockReply::row(
                 "SELECT name, type, default_kind FROM system.columns",
                 &["v", "Int32", ""],
@@ -1030,12 +1069,18 @@ async fn peerdb_mapping_races(environment: &Environment) -> TestResult {
                 "SELECT name, type, default_kind FROM system.columns",
                 &["v", "Int32", ""],
             ),
-            MockReply::row("SELECT engine FROM system.tables", &["MergeTree"]),
+            MockReply::row(
+                "SELECT engine, timezone() AS default_timezone FROM system.tables",
+                &["MergeTree", "UTC"],
+            ),
             MockReply::row(
                 "SELECT name, type, default_kind FROM system.columns",
                 &["v", "Int32", ""],
             ),
-            MockReply::row("SELECT engine FROM system.tables", &["MergeTree"]),
+            MockReply::row(
+                "SELECT engine, timezone() AS default_timezone FROM system.tables",
+                &["MergeTree", "UTC"],
+            ),
             MockReply::row(
                 "SELECT name, type, default_kind FROM system.columns",
                 &["v", "Int32", ""],
@@ -1317,7 +1362,8 @@ async fn tls_certificate_validation() -> TestResult {
         .config("tls-untrusted-ch", &[&environment.cases[0]], None)
         .await?;
     let output = environment.run(&config, "json", &[("PG_URL", &pg_url), ("CH_URL", &ch_url)])?;
-    environment.report("tls-untrusted-ch", &output, "unknown")?;
+    let report = environment.report("tls-untrusted-ch", &output, "unknown")?;
+    assert_eq!(report["errors"][0]["code"], "clickhouse_tls_error");
     let mut untrusted_pg = Url::parse(&pg_url)?;
     untrusted_pg.set_query(Some("sslmode=verify-full"));
     let config = environment
@@ -1328,7 +1374,8 @@ async fn tls_certificate_validation() -> TestResult {
         "json",
         &[("PG_URL", untrusted_pg.as_str()), ("CH_URL", &ch_url)],
     )?;
-    environment.report("tls-untrusted-pg", &output, "unknown")?;
+    let report = environment.report("tls-untrusted-pg", &output, "unknown")?;
+    assert_eq!(report["errors"][0]["code"], "postgres_tls_error");
     let mut wrong_host_pg = Url::parse(&pg_url)?;
     wrong_host_pg.set_host(Some("127.0.0.1"))?;
     let output = environment.run(
@@ -1336,7 +1383,8 @@ async fn tls_certificate_validation() -> TestResult {
         "json",
         &[("PG_URL", wrong_host_pg.as_str()), ("CH_URL", &ch_url)],
     )?;
-    environment.report("tls-hostname-pg", &output, "unknown")?;
+    let report = environment.report("tls-hostname-pg", &output, "unknown")?;
+    assert_eq!(report["errors"][0]["code"], "postgres_tls_error");
     let mut wrong_host_ch = Url::parse(&ch_url)?;
     wrong_host_ch.set_host(Some("127.0.0.1"))?;
     let output = environment.run(
@@ -1344,7 +1392,8 @@ async fn tls_certificate_validation() -> TestResult {
         "json",
         &[("PG_URL", &pg_url), ("CH_URL", wrong_host_ch.as_str())],
     )?;
-    environment.report("tls-hostname-ch", &output, "unknown")?;
+    let report = environment.report("tls-hostname-ch", &output, "unknown")?;
+    assert_eq!(report["errors"][0]["code"], "clickhouse_tls_error");
     ddl::tls_checks(&environment, &pg_url, &ch_url, &ca_cert).await?;
     environment.cleanup().await
 }

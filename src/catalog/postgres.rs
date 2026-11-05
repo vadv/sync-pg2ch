@@ -20,32 +20,7 @@ pub struct PostgresCatalog {
 impl PostgresCatalog {
     /// Connect with a deadline and disable driver statement logging.
     pub async fn connect(url: &str, deadline: Duration) -> Result<Self, CatalogError> {
-        let parsed = url::Url::parse(url).map_err(|_| {
-            CatalogError::new("invalid_postgres_url", "invalid PostgreSQL connection URL")
-        })?;
-        let mut ssl_mode = PgSslMode::VerifyFull;
-        for (name, value) in parsed.query_pairs() {
-            if name == "sslmode" {
-                ssl_mode = match value.as_ref() {
-                    "disable" => PgSslMode::Disable,
-                    "verify-full" => PgSslMode::VerifyFull,
-                    _ => {
-                        return Err(CatalogError::new(
-                            "invalid_postgres_tls_mode",
-                            "use sslmode=verify-full for verified TLS or sslmode=disable for explicit plaintext",
-                        ));
-                    }
-                };
-            }
-        }
-        let options = PgConnectOptions::from_str(url)
-            .map_err(|_| {
-                CatalogError::new("invalid_postgres_url", "invalid PostgreSQL connection URL")
-            })?
-            .ssl_mode(ssl_mode)
-            .options([("default_transaction_read_only", "on")])
-            .application_name("sync-pg2ch")
-            .disable_statement_logging();
+        let options = connection_options(url)?;
         let connection = tokio::time::timeout(deadline, options.connect())
             .await
             .map_err(|_| {
@@ -54,7 +29,7 @@ impl PostgresCatalog {
                     "PostgreSQL connection timed out",
                 )
             })?
-            .map_err(CatalogError::pg)?;
+            .map_err(|error| CatalogError::pg(error).during("connecting to PostgreSQL"))?;
         Ok(Self { connection })
     }
 
@@ -247,6 +222,66 @@ pub(crate) fn source_names<'a>(schema: &str, target: &'a str) -> Vec<&'a str> {
     names
 }
 
+fn connection_options(url: &str) -> Result<PgConnectOptions, CatalogError> {
+    let url = socket_url(url)?;
+    let parsed = url::Url::parse(&url).map_err(|_| {
+        CatalogError::new("invalid_postgres_url", "invalid PostgreSQL connection URL")
+    })?;
+    let mut ssl_mode = PgSslMode::VerifyFull;
+    for (name, value) in parsed.query_pairs() {
+        if name == "sslmode" {
+            ssl_mode = match value.as_ref() {
+                "disable" => PgSslMode::Disable,
+                "verify-full" => PgSslMode::VerifyFull,
+                _ => {
+                    return Err(CatalogError::new(
+                        "invalid_postgres_tls_mode",
+                        "use sslmode=verify-full for verified TLS or sslmode=disable for explicit plaintext",
+                    ));
+                }
+            };
+        }
+    }
+    let options = PgConnectOptions::from_str(&url)
+        .map_err(|_| {
+            CatalogError::new("invalid_postgres_url", "invalid PostgreSQL connection URL")
+        })?
+        .ssl_mode(ssl_mode)
+        .options([("default_transaction_read_only", "on")])
+        .application_name("sync-pg2ch")
+        .disable_statement_logging();
+    Ok(options)
+}
+
+fn socket_url(url: &str) -> Result<std::borrow::Cow<'_, str>, CatalogError> {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return Ok(std::borrow::Cow::Borrowed(url));
+    };
+    let Some((authority, path)) = rest.split_once('/') else {
+        return Ok(std::borrow::Cow::Borrowed(url));
+    };
+    if !authority.ends_with('@') {
+        return Ok(std::borrow::Cow::Borrowed(url));
+    }
+    let normalized = format!("{scheme}://{authority}localhost/{path}");
+    let parsed = url::Url::parse(&normalized).map_err(|_| {
+        CatalogError::new("invalid_postgres_url", "invalid PostgreSQL connection URL")
+    })?;
+    let mut socket = false;
+    for (key, value) in parsed.query_pairs() {
+        if key == "host" {
+            socket = value.starts_with('/');
+        }
+    }
+    if !socket {
+        return Err(CatalogError::new(
+            "invalid_postgres_url",
+            "a hostless PostgreSQL URL with a user requires host=/absolute/socket/directory",
+        ));
+    }
+    Ok(std::borrow::Cow::Owned(normalized))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -271,6 +306,24 @@ mod tests {
         ] {
             assert_eq!(super::source_names(schema, target), expected);
         }
+    }
+
+    #[test]
+    fn socket_urls_preserve_user_database_and_encoded_directory() {
+        for url in [
+            "postgres://reader@/app?host=/var/run/postgresql&sslmode=disable",
+            "postgresql:///app?user=reader&host=%2Fvar%2Frun%2Fpostgresql&sslmode=disable",
+            "postgres://reader@localhost/app?host=/var/run/postgresql&sslmode=disable",
+        ] {
+            let options = super::connection_options(url).unwrap();
+            assert_eq!(options.get_username(), "reader");
+            assert_eq!(options.get_database(), Some("app"));
+            assert_eq!(
+                options.get_socket().unwrap(),
+                &std::path::PathBuf::from("/var/run/postgresql")
+            );
+        }
+        assert!(super::connection_options("postgres://reader@/app?sslmode=disable").is_err());
     }
 
     #[test]

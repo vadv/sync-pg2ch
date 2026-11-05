@@ -7,6 +7,8 @@ use std::sync::{
 
 pub(super) async fn checks(environment: &Environment) -> TestResult {
     success(environment).await?;
+    peerdb_layout(environment).await?;
+    connection_timezone(environment).await?;
     blockers(environment).await?;
     permissions(environment).await?;
     races_and_dependencies(environment).await?;
@@ -243,6 +245,206 @@ pub(super) async fn tls_checks(
         2,
         "blocked",
     )?;
+    Ok(())
+}
+
+async fn peerdb_layout(environment: &Environment) -> TestResult {
+    let (path, database) = config(environment, "peerdb-layout").await?;
+    fixture(environment, &database, "ddl_orders",
+        "id integer NOT NULL, created_at timestamptz NOT NULL, note text, search_index tsvector, added text NOT NULL",
+        "id Int32, created_at DateTime64(6), note String, search_index String, _peerdb_version UInt64, _peerdb_is_deleted UInt8, _peerdb_synced_at DateTime64(9) DEFAULT now64(), independent Int64 DEFAULT id+1",
+        "ENGINE=ReplacingMergeTree(_peerdb_version) ORDER BY id").await?;
+    let name = format!("{}_ddl_orders", environment.schema);
+    environment
+        .ch
+        .query(&format!(
+            "RENAME TABLE {}.ddl_orders TO {}.{}",
+            identifier(&database),
+            identifier(&database),
+            identifier(&name)
+        ))
+        .execute()
+        .await?;
+    let table = format!("{}.{}", identifier(&database), identifier(&name));
+    environment.ch.query(&format!("INSERT INTO {table} (id,created_at,note,search_index,_peerdb_version,_peerdb_is_deleted) VALUES (1,'2024-01-01 12:00:00','old','text',1,0)")).execute().await?;
+    let original_values = format!(
+        "SELECT toJSONString(tuple(id,created_at,note,search_index,_peerdb_synced_at,independent)) FROM {table}"
+    );
+    let before: String = environment.ch.query(&original_values).fetch_one().await?;
+    for extra in ["_peerdb_raw_example", "orders_resync"] {
+        environment
+            .ch
+            .query(&format!(
+                "CREATE TABLE {}.{} (v Int32) ENGINE=MergeTree ORDER BY tuple()",
+                identifier(&database),
+                identifier(extra)
+            ))
+            .execute()
+            .await?;
+    }
+    let proxy = Proxy::start(&environment.ch_url, Fault::None)?;
+    report(
+        "unexcluded-services",
+        &environment.run_command("apply", &path, "json", &[("CH_URL", &proxy.url)])?,
+        1,
+        "blocked",
+    )?;
+    assert_eq!(alter_count(&proxy.finish()?), 0);
+    let mut settings: toml::Value = toml::from_str(&fs::read_to_string(&path)?)?;
+    settings.as_table_mut().unwrap().insert(
+        "discovery".into(),
+        toml::Value::try_from(
+            json!({"exclude_table_prefixes":["_peerdb_raw_"], "exclude_tables":["orders_resync"]}),
+        )?,
+    );
+    fs::write(&path, toml::to_string(&settings)?)?;
+    let diff = environment.report(
+        "peerdb-layout-diff",
+        &environment.run(&path, "json", &[])?,
+        "mismatch",
+    )?;
+    assert_eq!(diff["tables"].as_array().unwrap().len(), 1);
+    assert_eq!(diff["skipped_tables"].as_array().unwrap().len(), 2);
+    assert_eq!(diff["tables"][0]["source"]["table"], "ddl_orders");
+    let plan = report(
+        "peerdb-layout-plan",
+        &environment.run_command("plan", &path, "json", &[])?,
+        0,
+        "ready",
+    )?;
+    assert_eq!(plan["tables"][0]["operations"].as_array().unwrap().len(), 3);
+    assert_eq!(plan["skipped_tables"].as_array().unwrap().len(), 2);
+    let proxy = Proxy::start(&environment.ch_url, Fault::None)?;
+    let applied = report(
+        "peerdb-layout-apply",
+        &environment.run_command("apply", &path, "json", &[("CH_URL", &proxy.url)])?,
+        0,
+        "completed",
+    )?;
+    assert_eq!(alter_count(&proxy.finish()?), 1);
+    assert_eq!(applied["skipped_tables"].as_array().unwrap().len(), 2);
+    let after: String = environment.ch.query(&original_values).fetch_one().await?;
+    assert_eq!(before, after);
+    let added: u64 = environment
+        .ch
+        .query(&format!("SELECT count() FROM {table} WHERE added IS NULL"))
+        .fetch_one()
+        .await?;
+    assert_eq!(added, 1);
+    for extra in ["_peerdb_raw_example", "orders_resync"] {
+        assert!(
+            !definition(environment, &database, extra)
+                .await?
+                .contains("added")
+        );
+    }
+    settings["discovery"]["exclude_table_prefixes"] =
+        toml::Value::try_from(vec!["_peerdb_raw_", environment.schema.as_str()])?;
+    fs::write(&path, toml::to_string(&settings)?)?;
+    let empty = report(
+        "all-excluded",
+        &environment.run_command("apply", &path, "json", &[])?,
+        2,
+        "blocked",
+    )?;
+    assert_eq!(empty["errors"][0]["code"], "no_tables_selected");
+    environment.report(
+        "all-excluded-diff",
+        &environment.run(&path, "json", &[])?,
+        "unknown",
+    )?;
+    Ok(())
+}
+
+async fn connection_timezone(environment: &Environment) -> TestResult {
+    let (path, database) = config(environment, "connection-timezone").await?;
+    fixture(
+        environment,
+        &database,
+        "ddl_timezone_context",
+        "id integer NOT NULL, v timestamptz",
+        "id Int32, v DateTime64(6)",
+        "ENGINE=MergeTree ORDER BY id",
+    )
+    .await?;
+    let user = format!("{}_timezone", environment.database);
+    environment.ch.query(&format!("CREATE USER {} IDENTIFIED WITH sha256_password BY 'timezone-pass' SETTINGS session_timezone = 'Europe/Berlin'", identifier(&user))).execute().await?;
+    environment
+        .ch
+        .query(&format!(
+            "GRANT SHOW TABLES, SHOW COLUMNS ON *.* TO {}",
+            identifier(&user)
+        ))
+        .execute()
+        .await?;
+    for table in [
+        "data_skipping_indices",
+        "projections",
+        "mutations",
+        "processes",
+    ] {
+        environment
+            .ch
+            .query(&format!(
+                "GRANT SELECT ON system.{table} TO {}",
+                identifier(&user)
+            ))
+            .execute()
+            .await?;
+    }
+    environment
+        .ch
+        .query(&format!(
+            "GRANT ALTER MODIFY COLUMN ON {}.* TO {}",
+            identifier(&database),
+            identifier(&user)
+        ))
+        .execute()
+        .await?;
+    let overrides = [("CH_USER", user.as_str()), ("CH_PASSWORD", "timezone-pass")];
+    let diff = environment.report(
+        "timezone-berlin",
+        &environment.run(&path, "json", &overrides)?,
+        "mismatch",
+    )?;
+    assert_eq!(diff["tables"][0]["default_timezone"], "Europe/Berlin");
+    assert!(
+        diff["tables"][0]["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["code"] == "timezone_mismatch")
+    );
+    report(
+        "timezone-berlin-apply",
+        &environment.run_command("apply", &path, "json", &overrides)?,
+        1,
+        "blocked",
+    )?;
+    environment
+        .ch
+        .query(&format!(
+            "ALTER USER {} SETTINGS session_timezone = 'UTC'",
+            identifier(&user)
+        ))
+        .execute()
+        .await?;
+    report(
+        "timezone-utc-apply",
+        &environment.run_command("apply", &path, "json", &overrides)?,
+        0,
+        "completed",
+    )?;
+    environment.report(
+        "timezone-utc-diff",
+        &environment.run(&path, "json", &overrides)?,
+        "compatible",
+    )?;
+    environment
+        .ch
+        .query(&format!("DROP USER {}", identifier(&user)))
+        .execute()
+        .await?;
     Ok(())
 }
 

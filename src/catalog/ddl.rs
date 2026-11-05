@@ -58,7 +58,9 @@ impl ClickHouseCatalog {
                 .query(&query)
                 .fetch_one::<u8>()
                 .await
-                .map_err(CatalogError::ch)?
+                .map_err(|error| {
+                    CatalogError::ch(error).during("reading ClickHouse DDL metadata")
+                })?
                 == 0
             {
                 return Err(CatalogError::new(
@@ -80,21 +82,21 @@ impl ClickHouseCatalog {
             "SELECT toString(t.uuid) AS uuid, d.engine AS database_engine, t.engine, t.engine_full, t.create_table_query AS create_query, toUInt64(length(t.dependencies_table)) AS dependencies, (SELECT count() FROM system.data_skipping_indices WHERE database = ? AND table = ?) AS indexes, (SELECT count() FROM system.projections WHERE database = ? AND table = ?) AS projections FROM system.tables t INNER JOIN system.databases d ON t.database = d.name WHERE t.database = ? AND t.name = ?"
         ).bind(&target.database).bind(&target.table).bind(&target.database).bind(&target.table)
             .bind(&target.database).bind(&target.table)
-            .fetch_optional::<TableMetadata>().await.map_err(CatalogError::ch)?;
+            .fetch_optional::<TableMetadata>().await.map_err(|error| CatalogError::ch(error).during("reading ClickHouse DDL metadata"))?;
         let Some(table) = table else {
             return Ok(None);
         };
         let columns = self.client.query(
             "SELECT name, type AS data_type, default_kind, default_expression, compression_codec AS codec, comment, toUInt8(is_in_partition_key OR is_in_sorting_key OR is_in_primary_key OR is_in_sampling_key) AS in_key FROM system.columns WHERE database = ? AND table = ? ORDER BY name"
-        ).bind(&target.database).bind(&target.table).fetch_all::<ColumnMetadata>().await.map_err(CatalogError::ch)?;
+        ).bind(&target.database).bind(&target.table).fetch_all::<ColumnMetadata>().await.map_err(|error| CatalogError::ch(error).during("reading ClickHouse DDL metadata"))?;
         let pending_mutations = self.client.query("SELECT count() FROM system.mutations WHERE database = ? AND table = ? AND NOT is_done")
-            .bind(&target.database).bind(&target.table).fetch_one::<u64>().await.map_err(CatalogError::ch)?;
+            .bind(&target.database).bind(&target.table).fetch_one::<u64>().await.map_err(|error| CatalogError::ch(error).during("reading ClickHouse DDL metadata"))?;
         let active_alters = self
             .client
             .query("SELECT count() FROM system.processes WHERE query_kind = 'Alter'")
             .fetch_one::<u64>()
             .await
-            .map_err(CatalogError::ch)?;
+            .map_err(|error| CatalogError::ch(error).during("reading ClickHouse DDL metadata"))?;
         Ok(Some(Metadata {
             table,
             columns,
@@ -125,7 +127,7 @@ impl ClickHouseCatalog {
                 .with_setting("readonly", "0")
                 .fetch_one::<u8>()
                 .await
-                .map_err(CatalogError::ch)?
+                .map_err(|error| CatalogError::ch(error).during("checking ALTER privileges"))?
                 == 0
             {
                 return Ok(false);
@@ -178,11 +180,9 @@ impl Executor {
             ))),
             Ok(Err(error)) => {
                 let code = match &error {
-                    clickhouse::error::Error::BadResponse(message) => message
-                        .split("Code: ")
-                        .nth(1)
-                        .and_then(|value| value.split('.').next())
-                        .and_then(|value| value.parse::<u32>().ok()),
+                    clickhouse::error::Error::BadResponse(message) => {
+                        super::clickhouse_code(message)
+                    }
                     _ => None,
                 };
                 let error = CatalogError::new("ddl_execution_error", match code {

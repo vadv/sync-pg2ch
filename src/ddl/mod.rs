@@ -8,7 +8,7 @@ use serde::Serialize;
 use crate::{
     app::{Snapshot, compare_snapshot},
     catalog::{CatalogError, ddl::Metadata},
-    compatibility::{alter_destination, compare_types, expected_definition},
+    compatibility::{alter_destination, compare_types_in_timezone, expected_definition},
     config::{Config, SourceTable, TablePair, TargetTable},
     diff,
     model::{ChColumn, ChTable, Status, TableDiff},
@@ -124,6 +124,8 @@ pub struct PlanReport {
     pub status: PlanStatus,
     /// Discovered table plans.
     pub tables: Vec<TablePlan>,
+    /// Tables excluded explicitly from the DDL scope.
+    pub skipped_tables: Vec<crate::discovery::SkippedTable>,
     /// Operational diagnostics, without driver messages.
     pub errors: Vec<CatalogError>,
 }
@@ -136,6 +138,7 @@ impl PlanReport {
             mode,
             status: PlanStatus::Ready,
             tables: Vec::new(),
+            skipped_tables: Vec::new(),
             errors: Vec::new(),
         }
     }
@@ -262,19 +265,27 @@ fn plan_table(
                 data_type: format!("Nullable({data_type})"),
             }),
             Some(existing) => {
-                let comparison = compare_types(&column.data_type, &existing.data_type);
+                let comparison = compare_types_in_timezone(
+                    &column.data_type,
+                    &existing.data_type,
+                    current.default_timezone.as_deref(),
+                );
                 if comparison.status <= Status::Compatible
                     && (!column.nullable || comparison.target_nullable == Some(true))
                 {
                     continue;
                 }
-                alter_destination(&column.data_type, column.nullable, &existing.data_type).map(
-                    |data_type| Operation::ModifyColumn {
-                        column: column.name.clone(),
-                        from: existing.data_type.clone(),
-                        data_type,
-                    },
+                alter_destination(
+                    &column.data_type,
+                    column.nullable,
+                    &existing.data_type,
+                    current.default_timezone.as_deref(),
                 )
+                .map(|data_type| Operation::ModifyColumn {
+                    column: column.name.clone(),
+                    from: existing.data_type.clone(),
+                    data_type,
+                })
             }
         };
         match operation {
@@ -389,6 +400,10 @@ fn check_metadata(table: &mut TablePlan, metadata: &Metadata) {
             "TTL or constraints require a separate DDL compatibility rule",
         );
     }
+    let mut column_names = Vec::with_capacity(metadata.columns.len());
+    for column in &metadata.columns {
+        column_names.push(column.name.as_str());
+    }
     let operations = table.operations.clone();
     for operation in operations {
         let Operation::ModifyColumn { column, .. } = operation else {
@@ -404,16 +419,30 @@ fn check_metadata(table: &mut TablePlan, metadata: &Metadata) {
                     "changing a sorting, primary, partition or sampling key column is not supported",
                 );
             }
-            if !attributes.default_expression.is_empty()
-                && !sql::constant_expression(&attributes.default_expression)
-            {
-                block(
-                    table,
-                    Some(&column),
-                    "dependent_column_expression",
-                    Status::Mismatch,
-                    "a computed column expression requires a separate dependency rule",
-                );
+            if !attributes.default_expression.is_empty() {
+                match sql::expression_references(&attributes.default_expression, &column_names) {
+                    Some(references) if references.contains(&column) => block(
+                        table,
+                        Some(&column),
+                        "dependent_column_expression",
+                        Status::Mismatch,
+                        format!(
+                            "computed column {:?} depends on the column being modified",
+                            attributes.name
+                        ),
+                    ),
+                    Some(_) => {}
+                    None => block(
+                        table,
+                        Some(&column),
+                        "unresolved_column_expression",
+                        Status::Mismatch,
+                        format!(
+                            "dependencies of computed column {:?} could not be resolved",
+                            attributes.name
+                        ),
+                    ),
+                }
             }
             if attributes.name == column && !sql::generic_codec(&attributes.codec) {
                 block(
