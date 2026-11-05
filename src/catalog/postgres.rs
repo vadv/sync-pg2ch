@@ -77,6 +77,33 @@ impl PostgresCatalog {
         Ok((version, extensions))
     }
 
+    /// Find literal and PeerDB-default source names within the configured schema.
+    ///
+    /// All matching relations are returned so that collisions cannot select a source silently.
+    pub async fn source_candidates(
+        &mut self,
+        schema: &str,
+        target: &str,
+    ) -> Result<Vec<SourceTable>, CatalogError> {
+        let names = source_names(schema, target);
+        let names: Vec<String> = sqlx::query_scalar(
+            "SELECT c.relname::text FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname::text = ANY($2) ORDER BY c.relname COLLATE \"C\"",
+        )
+        .bind(schema)
+        .bind(&names)
+        .fetch_all(&mut self.connection)
+        .await
+        .map_err(CatalogError::pg)?;
+        let mut candidates = Vec::with_capacity(names.len());
+        for table in names {
+            candidates.push(SourceTable {
+                schema: schema.to_owned(),
+                table,
+            });
+        }
+        Ok(candidates)
+    }
+
     /// Read a selected relation and its visible, non-dropped columns.
     ///
     /// Catalog access failures are errors; only a successful empty lookup means absence.
@@ -208,8 +235,43 @@ fn quote_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// Return literal source names allowed by exact and PeerDB-default matching.
+pub(crate) fn source_names<'a>(schema: &str, target: &'a str) -> Vec<&'a str> {
+    let mut names = vec![target];
+    if let Some(table) = target.strip_prefix(&format!("{schema}_"))
+        && !table.is_empty()
+    {
+        names.push(table);
+    }
+    names
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn peerdb_prefix_is_literal_and_uses_the_entire_schema_name() {
+        for (schema, target, expected) in [
+            ("public", "orders", vec!["orders"]),
+            ("public", "public_orders", vec!["public_orders", "orders"]),
+            (
+                "sales_eu",
+                "sales_eu_order_items",
+                vec!["sales_eu_order_items", "order_items"],
+            ),
+            (
+                "public",
+                "public__orders",
+                vec!["public__orders", "_orders"],
+            ),
+            ("public", "public_", vec!["public_"]),
+            ("public", "public.orders", vec!["public.orders"]),
+            ("public", "Public_orders", vec!["Public_orders"]),
+            ("a.\"Ю", "a.\"Ю_Table", vec!["a.\"Ю_Table", "Table"]),
+        ] {
+            assert_eq!(super::source_names(schema, target), expected);
+        }
+    }
+
     #[test]
     fn extension_namespace_is_quoted_as_one_identifier() {
         assert_eq!(

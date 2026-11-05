@@ -130,8 +130,10 @@ pub struct Finding {
 /// Deterministic comparison result for one discovered pair of tables.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TableDiff {
-    /// Resolved PostgreSQL source identity.
-    pub source: crate::config::SourceTable,
+    /// Resolved PostgreSQL source identity, absent if resolution failed or was ambiguous.
+    pub source: Option<crate::config::SourceTable>,
+    /// Matching PostgreSQL relations observed during source resolution.
+    pub source_candidates: Vec<crate::config::SourceTable>,
     /// Discovered ClickHouse target identity.
     pub target: crate::config::TargetTable,
     /// Highest severity among findings for this pair.

@@ -58,7 +58,7 @@ pub struct Report {
 impl Default for Report {
     fn default() -> Self {
         Self {
-            report_version: 1,
+            report_version: 2,
             policy: "pg-clickhouse-v1",
             policy_limitations: vec![
                 "Only schema metadata is checked; row values and CDC serialization are not validated.",
@@ -81,8 +81,7 @@ impl Default for Report {
 impl Report {
     /// Recompute the aggregate status after collecting findings and errors.
     pub fn finish(&mut self) {
-        self.tables
-            .sort_by(|a, b| (&a.source, &a.target).cmp(&(&b.source, &b.target)));
+        self.tables.sort_by(|a, b| a.target.cmp(&b.target));
         for table in &mut self.tables {
             table
                 .findings
@@ -129,15 +128,25 @@ impl Report {
             self.policy
         )?;
         for table in &self.tables {
+            write!(writer, "{} ", status_name(table.status))?;
+            match &table.source {
+                Some(source) => write!(writer, "{:?}.{:?}", source.schema, source.table)?,
+                None => write!(writer, "(unresolved source)")?,
+            }
             writeln!(
                 writer,
-                "{} {:?}.{:?} -> {:?}.{:?}",
-                status_name(table.status),
-                table.source.schema,
-                table.source.table,
-                table.target.database,
-                table.target.table
+                " -> {:?}.{:?}",
+                table.target.database, table.target.table
             )?;
+            if table.source.is_none() && !table.source_candidates.is_empty() {
+                for source in &table.source_candidates {
+                    writeln!(
+                        writer,
+                        "  source candidate: {:?}.{:?}",
+                        source.schema, source.table
+                    )?;
+                }
+            }
             for finding in &table.findings {
                 if finding.status == Status::Match {
                     continue;
@@ -207,7 +216,7 @@ mod tests {
         let mut output = Vec::new();
         report.write_json(&mut output).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
-        assert_eq!(json["report_version"], 1);
+        assert_eq!(json["report_version"], 2);
         assert_eq!(json["status"], "unknown");
     }
 }

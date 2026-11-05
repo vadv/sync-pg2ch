@@ -293,7 +293,7 @@ impl Environment {
             String::from_utf8_lossy(&output.stdout)
         );
         let report: Value = serde_json::from_slice(&output.stdout)?;
-        assert_eq!(report["report_version"], 1, "{name}");
+        assert_eq!(report["report_version"], 2, "{name}");
         assert_eq!(report["policy"], "pg-clickhouse-v1", "{name}");
         assert_eq!(report["status"], status, "{name}");
         assert_eq!(report["complete"], status != "unknown", "{name}");
@@ -349,9 +349,9 @@ fn assert_cases(report: &Value, cases: &[&Case]) {
     }
     let mut previous = "";
     for table in tables {
-        let name = table["source"]["table"]
+        let name = table["target"]["table"]
             .as_str()
-            .expect("source table name");
+            .expect("target table name");
         assert!(
             previous <= name,
             "table report is not sorted: {previous}, {name}"
@@ -443,6 +443,8 @@ async fn services_compatibility_matrix() -> TestResult {
     assert_cases(&report, &mixed);
     cli_errors(&environment).await?;
     automatic_discovery(&environment).await?;
+    peerdb_discovery(&environment).await?;
+    peerdb_mapping_races(&environment).await?;
     metadata_only(&environment).await?;
     numeric_boundaries(&environment).await?;
     catalog_failures(&environment).await?;
@@ -453,6 +455,7 @@ struct MockReply {
     query: &'static str,
     body: Vec<u8>,
     delay: Duration,
+    before_reply: Option<Box<dyn FnOnce() -> TestResult + Send>>,
 }
 
 impl MockReply {
@@ -469,6 +472,7 @@ impl MockReply {
             query,
             body,
             delay: Duration::ZERO,
+            before_reply: None,
         }
     }
 
@@ -477,7 +481,13 @@ impl MockReply {
             query,
             body: vec![1],
             delay: Duration::ZERO,
+            before_reply: None,
         }
+    }
+
+    fn with_hook(mut self, hook: impl FnOnce() -> TestResult + Send + 'static) -> Self {
+        self.before_reply = Some(Box::new(hook));
+        self
     }
 }
 
@@ -486,7 +496,13 @@ fn mock_catalog(replies: Vec<MockReply>) -> TestResult<(String, thread::JoinHand
     let endpoint = format!("http://{}", listener.local_addr()?);
     listener.set_nonblocking(true)?;
     let server = thread::spawn(move || -> TestResult {
-        for MockReply { query, body, delay } in replies {
+        for MockReply {
+            query,
+            body,
+            delay,
+            before_reply,
+        } in replies
+        {
             let deadline = Instant::now() + Duration::from_secs(10);
             let mut stream = loop {
                 match listener.accept() {
@@ -527,6 +543,9 @@ fn mock_catalog(replies: Vec<MockReply>) -> TestResult<(String, thread::JoinHand
             request.read_exact(&mut sql)?;
             let sql = String::from_utf8(sql)?;
             assert!(sql.starts_with(query), "expected {query}, received {sql}");
+            if let Some(hook) = before_reply {
+                hook()?;
+            }
             if !delay.is_zero() {
                 thread::sleep(delay);
                 continue;
@@ -631,6 +650,7 @@ async fn catalog_failures(environment: &Environment) -> TestResult {
         query: "SELECT version()",
         body: Vec::new(),
         delay: Duration::from_millis(1500),
+        before_reply: None,
     }])?;
     let output = environment.run(&config, "json", &[("CH_URL", &endpoint)])?;
     server
@@ -786,6 +806,258 @@ async fn automatic_discovery(environment: &Environment) -> TestResult {
     assert_eq!(report["tables"].as_array().expect("tables").len(), 3);
     assert_eq!(report["tables"][2]["status"], "unknown");
     Ok(())
+}
+
+async fn peerdb_discovery(environment: &Environment) -> TestResult {
+    for (index, schema) in ["public", "Sales_eu.\"Ю"].into_iter().enumerate() {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE SCHEMA IF NOT EXISTS {}",
+            identifier(schema),
+        )))
+        .execute(&environment.pg)
+        .await?;
+        let config = environment
+            .config(&format!("peerdb-{index}"), &[], None)
+            .await?;
+        let mut settings: toml::Value = toml::from_str(&fs::read_to_string(&config)?)?;
+        settings["postgres"]["schema"] = toml::Value::String(schema.to_owned());
+        fs::write(&config, toml::to_string(&settings)?)?;
+        let database = settings["clickhouse"]["database"]
+            .as_str()
+            .expect("database");
+        let prefixed_literal = format!("{schema}_literal_prefixed");
+        let pairs = [
+            ("literal_only", "literal_only".to_owned()),
+            ("orders_items", format!("{schema}_orders_items")),
+            ("event.\"Ю", format!("{schema}_event.\"Ю")),
+            (prefixed_literal.as_str(), prefixed_literal.clone()),
+            ("_leading", format!("{schema}__leading")),
+        ];
+        for (source, target) in &pairs {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "CREATE TABLE {}.{} (v integer NOT NULL)",
+                identifier(schema),
+                identifier(source),
+            )))
+            .execute(&environment.pg)
+            .await?;
+            environment
+                .ch
+                .query(&format!(
+                    "CREATE TABLE {}.{} (v Int32) ENGINE=MergeTree ORDER BY tuple()",
+                    identifier(database),
+                    identifier(target),
+                ))
+                .execute()
+                .await?;
+        }
+        let report = environment.report(
+            "peerdb-match",
+            &environment.run(&config, "json", &[])?,
+            "match",
+        )?;
+        assert_eq!(
+            report["tables"].as_array().expect("tables").len(),
+            pairs.len()
+        );
+        for (source, target) in &pairs {
+            let table = table_report(&report, target);
+            assert_eq!(
+                table["source"],
+                json!({ "schema": schema, "table": source })
+            );
+            assert_eq!(table["source_candidates"], json!([table["source"]]));
+        }
+
+        let collision = format!("{schema}_orders_items");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TABLE {}.{} (v integer NOT NULL)",
+            identifier(schema),
+            identifier(&collision),
+        )))
+        .execute(&environment.pg)
+        .await?;
+        let report = environment.report(
+            "peerdb-ambiguous",
+            &environment.run(&config, "json", &[])?,
+            "unknown",
+        )?;
+        let table = table_report(&report, &collision);
+        assert!(table["source"].is_null());
+        assert_eq!(table["findings"][0]["code"], "ambiguous_source_table");
+        let mut candidates = ["orders_items", collision.as_str()];
+        candidates.sort();
+        assert_eq!(
+            table["source_candidates"],
+            json!([
+                { "schema": schema, "table": candidates[0] },
+                { "schema": schema, "table": candidates[1] },
+            ])
+        );
+        assert_eq!(report["counts"]["match"], pairs.len() - 1);
+        let output = environment.run(&config, "text", &[])?;
+        assert_eq!(output.status.code(), Some(2));
+        let text = String::from_utf8(output.stdout)?;
+        assert!(text.contains("(unresolved source)"));
+        assert_eq!(text.matches("source candidate:").count(), 2);
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP TABLE {}.orders_items",
+            identifier(schema),
+        )))
+        .execute(&environment.pg)
+        .await?;
+        let report = environment.report(
+            "peerdb-literal-prefix",
+            &environment.run(&config, "json", &[])?,
+            "match",
+        )?;
+        assert_eq!(
+            table_report(&report, &collision)["source"]["table"],
+            collision
+        );
+
+        for target in [
+            format!("{schema}_absent"),
+            "custom_rename".to_owned(),
+            "Public_literal_only".to_owned(),
+        ] {
+            environment
+                .ch
+                .query(&format!(
+                    "CREATE TABLE {}.{} (v Int32) ENGINE=MergeTree ORDER BY tuple()",
+                    identifier(database),
+                    identifier(&target),
+                ))
+                .execute()
+                .await?;
+        }
+        let report = environment.report(
+            "peerdb-missing",
+            &environment.run(&config, "json", &[])?,
+            "mismatch",
+        )?;
+        for target in [
+            format!("{schema}_absent"),
+            "custom_rename".to_owned(),
+            "Public_literal_only".to_owned(),
+        ] {
+            let table = table_report(&report, &target);
+            assert!(table["source"].is_null());
+            assert_eq!(table["source_candidates"], json!([]));
+            assert_eq!(table["findings"][0]["code"], "source_table_missing");
+        }
+    }
+    Ok(())
+}
+
+async fn peerdb_mapping_races(environment: &Environment) -> TestResult {
+    let config = environment.config("peerdb-races", &[], None).await?;
+    let target = format!("{}_peerdb_race", environment.schema);
+    let source = format!("{}.peerdb_race", identifier(&environment.schema));
+    let literal = format!(
+        "{}.{}",
+        identifier(&environment.schema),
+        identifier(&target)
+    );
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE {source} (v bigint NOT NULL)"
+    )))
+    .execute(&environment.pg)
+    .await?;
+    for (name, ddl, initial_code) in [
+        (
+            "collision-added",
+            format!("CREATE TABLE {literal} (v bigint NOT NULL)"),
+            "type_mismatch",
+        ),
+        (
+            "collision-removed",
+            format!("DROP TABLE {literal}"),
+            "ambiguous_source_table",
+        ),
+        (
+            "source-removed",
+            format!("DROP TABLE {source}"),
+            "type_mismatch",
+        ),
+        (
+            "source-added",
+            format!("CREATE TABLE {source} (v bigint NOT NULL)"),
+            "source_table_missing",
+        ),
+    ] {
+        let url = environment.pg_url.clone();
+        let barrier = MockReply::row("SELECT engine FROM system.tables", &["MergeTree"]).with_hook(
+            move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(async {
+                    let pool = sqlx::PgPool::connect(&url).await?;
+                    sqlx::query(sqlx::AssertSqlSafe(ddl)).execute(&pool).await?;
+                    pool.close().await;
+                    Ok(())
+                })
+            },
+        );
+        let (endpoint, server) = mock_catalog(vec![
+            MockReply::row("SELECT version()", &["26.8.36.3"]),
+            MockReply::grant("CHECK GRANT SHOW TABLES"),
+            MockReply::grant("CHECK GRANT SHOW COLUMNS"),
+            MockReply::row("SELECT name FROM system.databases", &["peerdb-races"]),
+            MockReply::row("SELECT name FROM system.tables", &[&target, "zz_barrier"]),
+            MockReply::row("SELECT engine FROM system.tables", &["MergeTree"]),
+            MockReply::row(
+                "SELECT name, type, default_kind FROM system.columns",
+                &["v", "Int32", ""],
+            ),
+            barrier,
+            MockReply::row(
+                "SELECT name, type, default_kind FROM system.columns",
+                &["v", "Int32", ""],
+            ),
+            MockReply::row("SELECT engine FROM system.tables", &["MergeTree"]),
+            MockReply::row(
+                "SELECT name, type, default_kind FROM system.columns",
+                &["v", "Int32", ""],
+            ),
+            MockReply::row("SELECT engine FROM system.tables", &["MergeTree"]),
+            MockReply::row(
+                "SELECT name, type, default_kind FROM system.columns",
+                &["v", "Int32", ""],
+            ),
+            MockReply::row("SELECT name FROM system.databases", &["peerdb-races"]),
+            MockReply::row("SELECT name FROM system.tables", &[&target, "zz_barrier"]),
+        ])?;
+        let output = environment.run(&config, "json", &[("CH_URL", &endpoint)])?;
+        server
+            .join()
+            .map_err(|_| "mock mapping race server panicked")??;
+        let report = environment.report(name, &output, "unknown")?;
+        let table = table_report(&report, &target);
+        let mut codes = BTreeSet::new();
+        for finding in table["findings"].as_array().expect("findings") {
+            codes.insert(finding["code"].as_str().expect("code"));
+        }
+        assert!(
+            codes.contains("source_mapping_changed_during_check"),
+            "{report}"
+        );
+        assert!(
+            codes.contains(initial_code),
+            "original finding was discarded: {report}"
+        );
+    }
+    Ok(())
+}
+
+fn table_report<'a>(report: &'a Value, target: &str) -> &'a Value {
+    for table in report["tables"].as_array().expect("tables") {
+        if table["target"]["table"] == target {
+            return table;
+        }
+    }
+    panic!("target {target:?} missing from report: {report}");
 }
 
 async fn metadata_only(environment: &Environment) -> TestResult {

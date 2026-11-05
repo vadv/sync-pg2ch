@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use crate::{
     catalog::{CatalogError, clickhouse::ClickHouseCatalog, postgres::PostgresCatalog},
-    config::{Config, SourceTable, TablePair, env_value},
+    config::{Config, SourceTable, TablePair, TargetTable, env_value},
     diff,
     model::{ChTable, Finding, PgTable, Status, TableDiff},
     report::Report,
@@ -77,34 +77,27 @@ pub async fn run(config: &Config) -> Report {
             return report;
         }
     };
-    let mut pairs = Vec::with_capacity(targets.len());
+    let mut snapshots = Vec::with_capacity(targets.len());
     for target in &targets {
-        pairs.push(TablePair {
-            source: SourceTable {
-                schema: config.postgres.schema.clone(),
-                table: target.table.clone(),
-            },
-            target: target.clone(),
-            ignore_target_columns: config.comparison.ignore_target_columns.clone(),
-        });
+        snapshots.push(read_snapshot(&mut postgres, &clickhouse, target, config).await);
     }
-    let mut snapshots = Vec::with_capacity(pairs.len());
-    for pair in &pairs {
-        snapshots.push(read_pair(&mut postgres, &clickhouse, pair, config.query_timeout()).await);
-    }
-    for (pair, snapshot) in pairs.iter().zip(snapshots) {
-        let (source, target) = match snapshot {
+    for (target, snapshot) in targets.iter().zip(snapshots) {
+        let snapshot = match snapshot {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                report.tables.push(failed_table(pair, &error));
+                report.tables.push(failed_table(target, config, &error));
                 report.errors.push(error);
                 continue;
             }
         };
-        let mut result = diff::compare(pair, source.as_ref(), target.as_ref());
-        let second = read_pair(&mut postgres, &clickhouse, pair, config.query_timeout()).await;
+        let mut result = compare_snapshot(target, &snapshot, config);
+        let second = read_snapshot(&mut postgres, &clickhouse, target, config).await;
         let error = match second {
-            Ok((ref pg, ref ch)) if pg == &source && ch == &target => None,
+            Ok(ref second) if second.candidates != snapshot.candidates => Some(CatalogError::new(
+                "source_mapping_changed_during_check",
+                "PostgreSQL source candidates changed between reads; rerun after DDL completes",
+            )),
+            Ok(ref second) if second == &snapshot => None,
             Ok(_) => Some(CatalogError::new(
                 "schema_changed_during_check",
                 "selected metadata changed between reads; rerun after DDL completes",
@@ -136,17 +129,76 @@ async fn bounded<T>(
         .map_err(|_| CatalogError::new("catalog_timeout", "catalog operation timed out"))?
 }
 
-async fn read_pair(
+#[derive(PartialEq, Eq)]
+struct Snapshot {
+    candidates: Vec<SourceTable>,
+    source: Option<PgTable>,
+    target: Option<ChTable>,
+}
+
+async fn read_snapshot(
     pg: &mut PostgresCatalog,
     ch: &ClickHouseCatalog,
-    pair: &TablePair,
-    deadline: Duration,
-) -> Result<(Option<PgTable>, Option<ChTable>), CatalogError> {
+    target: &TargetTable,
+    config: &Config,
+) -> Result<Snapshot, CatalogError> {
     let (source, target) = tokio::join!(
-        bounded(deadline, pg.table(&pair.source)),
-        bounded(deadline, ch.table(&pair.target))
+        bounded(config.query_timeout(), async {
+            let candidates = pg
+                .source_candidates(&config.postgres.schema, &target.table)
+                .await?;
+            let source = match candidates.as_slice() {
+                [source] => pg.table(source).await?,
+                [] | [_, _, ..] => None,
+            };
+            Ok((candidates, source))
+        }),
+        bounded(config.query_timeout(), ch.table(target))
     );
-    Ok((source?, target?))
+    let (candidates, source) = source?;
+    Ok(Snapshot {
+        candidates,
+        source,
+        target: target?,
+    })
+}
+
+fn compare_snapshot(target: &TargetTable, snapshot: &Snapshot, config: &Config) -> TableDiff {
+    let source = match snapshot.candidates.as_slice() {
+        [source] => source.clone(),
+        [] => SourceTable {
+            schema: config.postgres.schema.clone(),
+            table: target.table.clone(),
+        },
+        [_, _, ..] => {
+            let error = CatalogError::new(
+                "ambiguous_source_table",
+                "both the literal table name and the PeerDB schema_table name match PostgreSQL relations; source selection is ambiguous",
+            );
+            let mut result = failed_table(target, config, &error);
+            result.source_candidates = snapshot.candidates.clone();
+            return result;
+        }
+    };
+    let pair = TablePair {
+        source,
+        target: target.clone(),
+        ignore_target_columns: config.comparison.ignore_target_columns.clone(),
+    };
+    let mut result = diff::compare(&pair, snapshot.source.as_ref(), snapshot.target.as_ref());
+    result.source_candidates = snapshot.candidates.clone();
+    if snapshot.candidates.is_empty() {
+        let names = crate::catalog::postgres::source_names(&config.postgres.schema, &target.table);
+        for finding in &mut result.findings {
+            if finding.code == "source_table_missing" {
+                finding.message = format!(
+                    "no source relation in PostgreSQL schema {:?}; tried table names {:?}",
+                    config.postgres.schema, names,
+                );
+            }
+        }
+    }
+    result
 }
 
 fn error_finding(error: &CatalogError) -> Finding {
@@ -161,12 +213,13 @@ fn error_finding(error: &CatalogError) -> Finding {
     }
 }
 
-fn failed_table(pair: &TablePair, error: &CatalogError) -> TableDiff {
+fn failed_table(target: &TargetTable, config: &Config, error: &CatalogError) -> TableDiff {
     TableDiff {
-        source: pair.source.clone(),
-        target: pair.target.clone(),
+        source: None,
+        source_candidates: Vec::new(),
+        target: target.clone(),
         status: Status::Unknown,
         findings: vec![error_finding(error)],
-        ignored_target_columns: pair.ignore_target_columns.clone(),
+        ignored_target_columns: config.comparison.ignore_target_columns.clone(),
     }
 }

@@ -13,7 +13,11 @@ use crate::model::{ChColumn, ChTable, Finding, PgColumn, PgTable, Status, TableD
 #[must_use]
 pub fn compare(pair: &TablePair, source: Option<&PgTable>, target: Option<&ChTable>) -> TableDiff {
     let mut result = TableDiff {
-        source: pair.source.clone(),
+        source: source.map(|_| pair.source.clone()),
+        source_candidates: match source {
+            Some(_) => vec![pair.source.clone()],
+            None => Vec::new(),
+        },
         target: pair.target.clone(),
         status: Status::Match,
         findings: Vec::new(),
